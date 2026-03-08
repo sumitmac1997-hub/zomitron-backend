@@ -1,0 +1,152 @@
+const express = require('express');
+const router = express.Router();
+const asyncHandler = require('express-async-handler');
+const Stripe = require('stripe');
+const Razorpay = require('razorpay');
+const crypto = require('crypto');
+const Order = require('../models/Order');
+const Vendor = require('../models/Vendor');
+const { protect, optionalAuth } = require('../middleware/auth');
+
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
+    ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
+    : null;
+
+// POST /api/payments/stripe/intent — Create Stripe Payment Intent
+router.post('/stripe/intent', optionalAuth, asyncHandler(async (req, res) => {
+    if (!stripe) return res.status(503).json({ success: false, message: 'Stripe not configured' });
+
+    const { orderId } = req.body;
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    const paymentIntent = await stripe.paymentIntents.create({
+        amount: Math.round(order.total * 100), // convert to paise/cents
+        currency: 'inr',
+        metadata: { orderId: order._id.toString(), orderNumber: order.orderNumber },
+        description: `Zomitron Order ${order.orderNumber}`,
+    });
+
+    order.paymentIntentId = paymentIntent.id;
+    await order.save();
+
+    res.json({
+        success: true,
+        clientSecret: paymentIntent.client_secret,
+        paymentIntentId: paymentIntent.id,
+        amount: order.total,
+    });
+}));
+
+// POST /api/payments/stripe/webhook — Stripe webhook
+router.post('/stripe/webhook', express.raw({ type: 'application/json' }), asyncHandler(async (req, res) => {
+    if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+        return res.status(200).end();
+    }
+    const sig = req.headers['stripe-signature'];
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        return res.status(400).json({ error: `Webhook Error: ${err.message}` });
+    }
+
+    if (event.type === 'payment_intent.succeeded') {
+        const pi = event.data.object;
+        const order = await Order.findOne({ paymentIntentId: pi.id });
+        if (order) {
+            order.paymentStatus = 'paid';
+            order.orderStatus = 'confirmed';
+            order.confirmedAt = new Date();
+            await order.save();
+            const io = req.app.get('io');
+            if (io) io.emitToUser(order.customerId?.toString(), 'paymentSuccess', { orderId: order._id });
+        }
+    }
+    res.json({ received: true });
+}));
+
+// POST /api/payments/razorpay/order — Create Razorpay Order
+router.post('/razorpay/order', optionalAuth, asyncHandler(async (req, res) => {
+    if (!razorpay) return res.status(503).json({ success: false, message: 'Razorpay not configured' });
+
+    const { orderId } = req.body;
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    const rzpOrder = await razorpay.orders.create({
+        amount: Math.round(order.total * 100), // paise
+        currency: 'INR',
+        receipt: order.orderNumber,
+        notes: { orderId: order._id.toString() },
+    });
+
+    order.razorpayOrderId = rzpOrder.id;
+    await order.save();
+
+    res.json({
+        success: true,
+        razorpayOrderId: rzpOrder.id,
+        amount: order.total,
+        currency: 'INR',
+        keyId: process.env.RAZORPAY_KEY_ID,
+        orderNumber: order.orderNumber,
+    });
+}));
+
+// POST /api/payments/razorpay/verify — Verify Razorpay payment
+router.post('/razorpay/verify', optionalAuth, asyncHandler(async (req, res) => {
+    const { razorpayOrderId, razorpayPaymentId, razorpaySignature, orderId } = req.body;
+
+    const expectedSig = crypto
+        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .update(`${razorpayOrderId}|${razorpayPaymentId}`)
+        .digest('hex');
+
+    if (expectedSig !== razorpaySignature) {
+        return res.status(400).json({ success: false, message: 'Invalid payment signature' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    order.paymentStatus = 'paid';
+    order.orderStatus = 'confirmed';
+    order.confirmedAt = new Date();
+    order.razorpayPaymentId = razorpayPaymentId;
+    await order.save();
+
+    const io = req.app.get('io');
+    if (io) io.emitToUser(order.customerId?.toString(), 'paymentSuccess', { orderId: order._id });
+
+    res.json({ success: true, message: 'Payment verified', order: { _id: order._id, orderNumber: order.orderNumber, orderStatus: order.orderStatus } });
+}));
+
+// POST /api/payments/cod/confirm — COD order confirmation
+router.post('/cod/confirm', protect, asyncHandler(async (req, res) => {
+    const { orderId } = req.body;
+    const order = await Order.findById(orderId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    order.orderStatus = 'confirmed';
+    order.confirmedAt = new Date();
+    await order.save();
+    res.json({ success: true, order });
+}));
+
+// GET /api/payments/config — Return public payment keys
+router.get('/config', (req, res) => {
+    res.json({
+        success: true,
+        stripe: { publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null },
+        razorpay: { keyId: process.env.RAZORPAY_KEY_ID || null },
+        paypal: { clientId: process.env.PAYPAL_CLIENT_ID || null },
+        available: {
+            stripe: !!process.env.STRIPE_SECRET_KEY,
+            razorpay: !!process.env.RAZORPAY_KEY_ID,
+            cod: true,
+        },
+    });
+}),
+
+    module.exports = router;

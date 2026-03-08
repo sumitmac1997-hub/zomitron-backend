@@ -1,0 +1,298 @@
+const express = require('express');
+const router = express.Router();
+const asyncHandler = require('express-async-handler');
+const User = require('../models/User');
+const Vendor = require('../models/Vendor');
+const Product = require('../models/Product');
+const Order = require('../models/Order');
+const Category = require('../models/Category');
+const { protect, authorize } = require('../middleware/auth');
+const { geocodePincode } = require('../utils/geocode');
+const { uploadVendor, toUploadUrl } = require('../config/cloudinary');
+const { buildInvoicePdf } = require('../utils/pdfInvoice');
+
+// All admin routes require auth + admin role
+router.use(protect, authorize('admin'));
+
+// GET /api/admin/dashboard — Analytics overview
+router.get('/dashboard', asyncHandler(async (req, res) => {
+    const { period } = req.query;
+    const matchByPeriod = {};
+    if (period && period !== 'all') {
+        const days = parseInt(period);
+        if (!Number.isNaN(days) && days > 0) {
+            matchByPeriod.createdAt = { $gte: new Date(Date.now() - days * 24 * 60 * 60 * 1000) };
+        }
+    }
+
+    const [
+        totalUsers, totalVendors, totalProducts, totalOrders,
+        revenueResult, pendingVendors, recentOrders, salesByCategory,
+    ] = await Promise.all([
+        User.countDocuments({ role: 'customer' }),
+        Vendor.countDocuments({ approved: true }),
+        Product.countDocuments({ isActive: true }),
+        Order.countDocuments(matchByPeriod),
+        Order.aggregate([
+            { $match: { ...matchByPeriod, paymentStatus: 'paid' } },
+            { $group: { _id: null, total: { $sum: '$total' }, platformFee: { $sum: '$platformFee' } } },
+        ]),
+        Vendor.countDocuments({ approved: false }),
+        Order.find(matchByPeriod)
+            .populate('customerId', 'name')
+            .sort({ createdAt: -1 })
+            .limit(10)
+            .lean(),
+        Order.aggregate([
+            { $match: matchByPeriod },
+            { $unwind: '$items' },
+            { $lookup: { from: 'products', localField: 'items.productId', foreignField: '_id', as: 'product' } },
+            { $unwind: '$product' },
+            { $lookup: { from: 'categories', localField: 'product.category', foreignField: '_id', as: 'cat' } },
+            { $unwind: { path: '$cat', preserveNullAndEmptyArrays: true } },
+            { $group: { _id: '$cat.name', total: { $sum: '$items.subtotal' }, count: { $sum: 1 } } },
+            { $sort: { total: -1 } }, { $limit: 10 },
+        ]),
+    ]);
+
+    res.json({
+        success: true,
+        stats: {
+            totalUsers, totalVendors, totalProducts, totalOrders,
+            revenue: revenueResult[0]?.total || 0,
+            platformEarnings: revenueResult[0]?.platformFee || 0,
+            pendingVendors,
+        },
+        recentOrders,
+        salesByCategory,
+    });
+}));
+
+// GET /api/admin/vendors — All vendors (paginated)
+router.get('/vendors', asyncHandler(async (req, res) => {
+    const { page = 1, limit = 20, approved, search } = req.query;
+    const query = {};
+    if (approved !== undefined) query.approved = approved === 'true';
+    if (search) query.storeName = { $regex: search, $options: 'i' };
+
+    const total = await Vendor.countDocuments(query);
+    const vendors = await Vendor.find(query)
+        .populate('userId', 'name email phone createdAt')
+        .sort({ createdAt: -1 })
+        .skip((parseInt(page) - 1) * parseInt(limit))
+        .limit(parseInt(limit))
+        .lean();
+
+    res.json({ success: true, vendors, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) });
+}));
+
+// PUT /api/admin/vendors/approve/:id
+router.put('/vendors/approve/:id', asyncHandler(async (req, res) => {
+    const { approved, rejectionReason } = req.body;
+    const vendor = await Vendor.findByIdAndUpdate(
+        req.params.id,
+        { approved, rejectionReason: approved ? undefined : rejectionReason, approvedAt: approved ? new Date() : undefined, approvedBy: req.user._id },
+        { new: true }
+    ).populate('userId', 'name email');
+
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+
+    // Notify vendor user
+    const io = req.app.get('io');
+    if (io) io.emitToUser(vendor.userId._id.toString(), 'vendorApproval', { approved, message: approved ? 'Your store is approved!' : rejectionReason });
+
+    res.json({ success: true, vendor, message: approved ? 'Vendor approved' : 'Vendor rejected' });
+}));
+
+// GET /api/admin/vendors/:id — Get full vendor detail
+router.get('/vendors/:id', asyncHandler(async (req, res) => {
+    const vendor = await Vendor.findById(req.params.id)
+        .populate('userId', 'name email phone createdAt avatar')
+        .lean();
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+    res.json({ success: true, vendor });
+}));
+
+// PUT /api/admin/vendors/:id — edit vendor profile
+router.put('/vendors/:id', uploadVendor.fields([
+    { name: 'storeLogo', maxCount: 1 },
+    { name: 'storeBanner', maxCount: 1 },
+]), asyncHandler(async (req, res) => {
+    const updates = { ...req.body };
+
+    if (req.files?.storeLogo) updates.storeLogo = toUploadUrl(req.files.storeLogo[0]);
+    if (req.files?.storeBanner) updates.storeBanner = toUploadUrl(req.files.storeBanner[0]);
+
+    if (updates.address && typeof updates.address === 'string') updates.address = JSON.parse(updates.address);
+    if (updates.storeHours && typeof updates.storeHours === 'string') updates.storeHours = JSON.parse(updates.storeHours);
+    if (updates.bankDetails && typeof updates.bankDetails === 'string') updates.bankDetails = JSON.parse(updates.bankDetails);
+
+    // Re-geocode if pincode changed
+    let vendor = await Vendor.findById(req.params.id);
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+
+    if (updates.pincode && updates.pincode !== vendor.pincode) {
+        const geo = await geocodePincode(updates.pincode);
+        if (geo) {
+            updates.location = { type: 'Point', coordinates: [geo.lng, geo.lat] };
+            updates.city = updates.city || geo.city;
+            updates.state = updates.state || geo.state;
+            await Product.updateMany(
+                { vendorId: vendor._id },
+                { location: updates.location, pincode: updates.pincode, city: updates.city }
+            );
+        }
+    }
+
+    vendor = await Vendor.findByIdAndUpdate(req.params.id, updates, { new: true, runValidators: true });
+    res.json({ success: true, vendor });
+}));
+
+// PUT /api/admin/vendors/:id/open — toggle store availability
+router.put('/vendors/:id/open', asyncHandler(async (req, res) => {
+    const { isOpen } = req.body;
+    const vendor = await Vendor.findByIdAndUpdate(req.params.id, { isOpen: !!isOpen }, { new: true, runValidators: true });
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+    res.json({ success: true, vendor });
+}));
+
+// PUT /api/admin/vendors/:id/commission
+router.put('/vendors/:id/commission', asyncHandler(async (req, res) => {
+    const { commissionRate } = req.body;
+    if (commissionRate < 0 || commissionRate > 1) return res.status(400).json({ success: false, message: 'Invalid commission rate (0-1)' });
+    const vendor = await Vendor.findByIdAndUpdate(req.params.id, { commissionRate }, { new: true });
+    res.json({ success: true, vendor });
+}));
+
+// GET /api/admin/orders
+router.get('/orders', asyncHandler(async (req, res) => {
+    const { page = 1, limit = 20, status, vendorId, from, to, search } = req.query;
+    const query = {};
+    if (status) query.orderStatus = status;
+    if (vendorId) query.vendorIds = vendorId;
+    if (from || to) {
+        query.createdAt = {};
+        if (from) query.createdAt.$gte = new Date(from);
+        if (to) query.createdAt.$lte = new Date(to);
+    }
+    if (search) {
+        const term = search.trim();
+        query.orderNumber = { $regex: term, $options: 'i' };
+    }
+
+    const limitNum = Math.min(parseInt(limit), 100);
+    const total = await Order.countDocuments(query);
+    const orders = await Order.find(query)
+        .populate('customerId', 'name email')
+        .populate('vendorIds', 'storeName')
+        .sort({ createdAt: -1 })
+        .skip((parseInt(page) - 1) * parseInt(limit))
+        .limit(limitNum)
+        .lean();
+
+    res.json({ success: true, orders, total, page: parseInt(page), pages: Math.ceil(total / limitNum) });
+}));
+
+// GET /api/admin/orders/:id/invoice — PDF invoice
+router.get('/orders/:id/invoice', asyncHandler(async (req, res) => {
+    const order = await Order.findById(req.params.id)
+        .populate('customerId', 'name email phone')
+        .populate('vendorIds', 'storeName')
+        .lean();
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    const pdf = buildInvoicePdf(order);
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename=invoice-${order.orderNumber || order._id}.pdf`);
+    res.send(pdf);
+}));
+
+// GET /api/admin/products — All products (moderation)
+router.get('/products', asyncHandler(async (req, res) => {
+    const { page = 1, limit = 20, isApproved, vendorId } = req.query;
+    const query = {};
+    if (isApproved !== undefined) query.isApproved = isApproved === 'true';
+    if (vendorId) query.vendorId = vendorId;
+
+    const total = await Product.countDocuments(query);
+    const products = await Product.find(query)
+        .populate('vendorId', 'storeName')
+        .sort({ createdAt: -1 })
+        .skip((parseInt(page) - 1) * parseInt(limit))
+        .limit(parseInt(limit))
+        .lean();
+
+    res.json({
+        success: true,
+        products,
+        total,
+        page: parseInt(page),
+        pages: Math.ceil(total / parseInt(limit)),
+    });
+}));
+
+// PUT /api/admin/products/:id/approve
+router.put('/products/:id/approve', asyncHandler(async (req, res) => {
+    const { isApproved } = req.body;
+    const product = await Product.findByIdAndUpdate(req.params.id, { isApproved }, { new: true });
+    res.json({ success: true, product });
+}));
+
+// GET /api/admin/payouts — Pending vendor payouts
+router.get('/payouts', asyncHandler(async (req, res) => {
+    const vendors = await Vendor.find({ balance: { $gt: 0 } })
+        .populate('userId', 'name email')
+        .select('storeName balance bankDetails userId')
+        .lean();
+    res.json({ success: true, vendors });
+}));
+
+// POST /api/admin/payouts/:vendorId — Process payout
+router.post('/payouts/:vendorId', asyncHandler(async (req, res) => {
+    const { amount } = req.body;
+    const vendor = await Vendor.findById(req.params.vendorId);
+    if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+    if (vendor.balance < amount) return res.status(400).json({ success: false, message: 'Insufficient vendor balance' });
+
+    await Vendor.findByIdAndUpdate(vendor._id, {
+        $inc: { balance: -amount, totalWithdrawn: amount },
+    });
+
+    res.json({ success: true, message: `Payout of ₹${amount} processed for ${vendor.storeName}` });
+}));
+
+// GET /api/admin/users
+router.get('/users', asyncHandler(async (req, res) => {
+    const { page = 1, limit = 20, role, search, from, to } = req.query;
+    const query = {};
+    if (role) query.role = role;
+    if (search) query.$or = [{ name: { $regex: search, $options: 'i' } }, { email: { $regex: search, $options: 'i' } }];
+    if (from || to) {
+        query.createdAt = {};
+        if (from) query.createdAt.$gte = new Date(from);
+        if (to) query.createdAt.$lte = new Date(to);
+    }
+
+    const users = await User.find(query).sort({ createdAt: -1 })
+        .skip((parseInt(page) - 1) * parseInt(limit)).limit(parseInt(limit)).lean();
+    const total = await User.countDocuments(query);
+    res.json({ success: true, users, total });
+}));
+
+// PUT /api/admin/users/:id/status
+router.put('/users/:id/status', asyncHandler(async (req, res) => {
+    const user = await User.findByIdAndUpdate(req.params.id, { isActive: req.body.isActive }, { new: true });
+    res.json({ success: true, user });
+}));
+
+// GET /api/admin/analytics/sales-by-region
+router.get('/analytics/sales-by-region', asyncHandler(async (req, res) => {
+    const stats = await Order.aggregate([
+        { $match: { paymentStatus: 'paid' } },
+        { $group: { _id: '$deliveryAddress.city', total: { $sum: '$total' }, count: { $sum: 1 } } },
+        { $sort: { total: -1 } }, { $limit: 20 },
+    ]);
+    res.json({ success: true, stats });
+}));
+
+module.exports = router;
