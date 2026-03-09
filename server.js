@@ -6,22 +6,14 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const dotenv = require('dotenv');
 const rateLimit = require('express-rate-limit');
-const connectDB = require('./config/db');
-const { initSocket } = require('./config/socket');
 const path = require('path');
 const { syncDefaultCategories } = require('./utils/syncDefaultCategories');
 
 // Load env
 dotenv.config();
 
-// Connect to MongoDB (tests manage their own connection)
-if (process.env.NODE_ENV !== 'test') {
-  connectDB();
-  // Ensure base categories exist on boot
-  syncDefaultCategories().catch((err) => {
-    console.error('Category sync failed on startup:', err.message);
-  });
-}
+const connectDB = require('./config/db');
+const { initSocket } = require('./config/socket');
 
 const app = express();
 const server = http.createServer(app);
@@ -136,7 +128,22 @@ const startServer = () => {
 };
 
 if (process.env.NODE_ENV !== 'test') {
-  startServer();
+  const bootstrap = async () => {
+    try {
+      await connectDB();
+      try {
+        await syncDefaultCategories();
+      } catch (err) {
+        console.error('Category sync failed on startup:', err.message);
+      }
+      startServer();
+    } catch (err) {
+      console.error('Startup failed:', err.message);
+      process.exit(1);
+    }
+  };
+
+  bootstrap();
 }
 
 module.exports = { app, server };

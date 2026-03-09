@@ -1,19 +1,43 @@
 const mongoose = require('mongoose');
-const { MongoMemoryServer } = require('mongodb-memory-server');
 const User = require('../models/User');
 const Vendor = require('../models/Vendor');
 const Product = require('../models/Product');
 const Category = require('../models/Category');
 const Pincode = require('../models/Pincode');
 
+const isEnabled = (value) => String(value || '').toLowerCase() === 'true';
+
+const getMongoMemoryServer = () => {
+    try {
+        return require('mongodb-memory-server').MongoMemoryServer;
+    } catch (error) {
+        throw new Error('mongodb-memory-server is unavailable. Disable USE_MEMORY_DB/FALLBACK_MEMORY_DB or install dev dependencies.');
+    }
+};
+
 const connectDB = async () => {
     let uri = process.env.MONGO_URI;
-    const useMemory = (process.env.USE_MEMORY_DB || '').toLowerCase() === 'true';
+    const isProduction = process.env.NODE_ENV === 'production';
+    const allowMemoryInProduction = isEnabled(process.env.ALLOW_MEMORY_DB_IN_PRODUCTION);
+    const canUseMemory = !isProduction || allowMemoryInProduction;
+    const requestedMemory = isEnabled(process.env.USE_MEMORY_DB);
+    const requestedFallbackMemory = isEnabled(process.env.FALLBACK_MEMORY_DB);
+    const useMemory = canUseMemory && requestedMemory;
+    const allowMemoryFallback = canUseMemory && requestedFallbackMemory;
     const memoryServerVersion = process.env.MONGOMS_VERSION || '7.0.3'; // >=7.0.3 required on Debian 12 (Render)
     let memServer;
 
+    if (isProduction && !allowMemoryInProduction && (!uri || requestedMemory || requestedFallbackMemory)) {
+        console.warn('In-memory MongoDB is disabled in production. Set MONGO_URI to Atlas and keep USE_MEMORY_DB/FALLBACK_MEMORY_DB off.');
+    }
+
     const resolveUri = async () => {
+        if (!uri && !useMemory) {
+            throw new Error('MONGO_URI is required when in-memory MongoDB is disabled.');
+        }
+
         if (!uri || useMemory) {
+            const MongoMemoryServer = getMongoMemoryServer();
             memServer = await MongoMemoryServer.create({
                 instance: {
                     dbName: process.env.MONGO_DB_NAME || 'zomitron',
@@ -165,7 +189,7 @@ const connectDB = async () => {
         await connectWithUri();
         await ensureIndexesAndDefaults();
     } catch (error) {
-        if (!useMemory && (process.env.FALLBACK_MEMORY_DB || '').toLowerCase() === 'true') {
+        if (!useMemory && allowMemoryFallback) {
             console.warn('⚠️  Primary Mongo connection failed, falling back to in-memory MongoDB.');
             uri = null; // force re-resolve to memory
             await connectWithUri('memory-fallback');
