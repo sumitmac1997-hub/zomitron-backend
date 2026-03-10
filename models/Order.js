@@ -61,6 +61,15 @@ const orderSchema = new mongoose.Schema(
         estimatedDelivery: Date,
         deliveryDistance: Number, // km from vendor
         deliveryCharge: Number,
+        shippingRule: {
+            ruleId: { type: mongoose.Schema.Types.ObjectId, ref: 'ShippingRule', default: null },
+            city: String,
+            freeShippingThreshold: Number,
+            baseShippingCharge: Number,
+            appliedCharge: Number,
+            matchingMode: String,
+            pincodeRangesText: String,
+        },
         // Order Status
         orderStatus: {
             type: String,

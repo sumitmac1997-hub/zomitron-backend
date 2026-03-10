@@ -37,6 +37,53 @@ const parseImages = (val) => clean(val)
     .map((s) => clean(s))
     .filter(Boolean);
 
+const coerceNumber = (val) => {
+    if (val === null || val === undefined) return undefined;
+    const num = Number(val);
+    return Number.isNaN(num) ? undefined : num;
+};
+
+const coerceBoolean = (val) => {
+    if (val === null || val === undefined) return undefined;
+    if (typeof val === 'boolean') return val;
+    return ['true', '1', 'yes', 'on'].includes(String(val).toLowerCase());
+};
+
+const parseStringList = (val, splitPattern = /[,|]/) => {
+    if (val === null || val === undefined) return [];
+    if (Array.isArray(val)) {
+        return val
+            .flatMap((item) => String(item).split(splitPattern))
+            .map((item) => clean(item))
+            .filter(Boolean);
+    }
+    return String(val)
+        .split(splitPattern)
+        .map((item) => clean(item))
+        .filter(Boolean);
+};
+
+const parseIdList = (val) => [...new Set(parseStringList(val, /,/))];
+
+const buildCatalogSearch = (search) => {
+    const term = clean(search);
+    if (!term) return null;
+    return {
+        $or: [
+            { title: { $regex: term, $options: 'i' } },
+            { description: { $regex: term, $options: 'i' } },
+            { sku: { $regex: term, $options: 'i' } },
+            { categoryName: { $regex: term, $options: 'i' } },
+            { tags: { $in: [new RegExp(term, 'i')] } },
+        ],
+    };
+};
+
+const getCanonicalSourceId = (product) => {
+    if (!product) return null;
+    return String(product.sourceProductId?._id || product.sourceProductId || product._id);
+};
+
 const mapCsvRowToProduct = async (row, vendor) => {
     const title = clean(row.title || row.Title || row.Name);
     const description = clean(row.description || row.Description || row['Short description'] || row['Short Description']);
@@ -310,6 +357,7 @@ router.get('/search', asyncHandler(async (req, res) => {
         isActive: true, isApproved: true, stock: { $gt: 0 },
         $or: [
             { title: { $regex: q, $options: 'i' } },
+            { description: { $regex: q, $options: 'i' } },
             { tags: { $in: [new RegExp(q, 'i')] } },
             { categoryName: { $regex: q, $options: 'i' } },
         ],
@@ -331,7 +379,9 @@ router.get('/search', asyncHandler(async (req, res) => {
                 $match: {
                     $or: [
                         { title: { $regex: q, $options: 'i' } },
+                        { description: { $regex: q, $options: 'i' } },
                         { tags: { $in: [new RegExp(q, 'i')] } },
+                        { categoryName: { $regex: q, $options: 'i' } },
                     ],
                 },
             },
@@ -342,6 +392,113 @@ router.get('/search', asyncHandler(async (req, res) => {
     }
 
     res.json({ success: true, products });
+}));
+
+// GET /api/products/library — reusable catalog for vendor/admin add-to-store flow
+router.get('/library', protect, authorize('vendor', 'admin'), asyncHandler(async (req, res) => {
+    const { page = 1, limit = 24, search, category, vendorId } = req.query;
+    const pageNum = Math.max(parseInt(page, 10) || 1, 1);
+    const limitNum = Math.min(Math.max(parseInt(limit, 10) || 24, 1), 100);
+    const skip = (pageNum - 1) * limitNum;
+    const query = req.user.role === 'admin'
+        ? {}
+        : { isActive: true, isApproved: true };
+
+    let currentVendor = null;
+    if (req.user.role === 'vendor') {
+        currentVendor = await Vendor.findOne({ userId: req.user._id, approved: true }).select('_id');
+        if (!currentVendor) {
+            return res.status(403).json({ success: false, message: 'Vendor not approved or not found' });
+        }
+        query.vendorId = { $ne: currentVendor._id };
+    }
+
+    const searchQuery = buildCatalogSearch(search);
+    if (searchQuery) Object.assign(query, searchQuery);
+    if (vendorId) {
+        if (req.user.role === 'vendor' && String(vendorId) === String(currentVendor?._id)) {
+            query.vendorId = null;
+        } else {
+            query.vendorId = vendorId;
+        }
+    }
+    if (category) {
+        query.$and = [
+            ...(query.$and || []),
+            { $or: [{ category }, { categories: category }] },
+        ];
+    }
+
+    const total = await Product.countDocuments(query);
+    const products = await Product.find(query)
+        .populate('vendorId', 'storeName storeLogo city state')
+        .populate('category', 'name slug icon')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean();
+
+    let alreadyOwnedSourceIds = new Set();
+    if (currentVendor && products.length > 0) {
+        const sourceIds = [...new Set(products.map((product) => getCanonicalSourceId(product)))];
+        const ownedProducts = await Product.find({
+            vendorId: currentVendor._id,
+            $or: [
+                { _id: { $in: sourceIds } },
+                { sourceProductId: { $in: sourceIds } },
+            ],
+        }).select('_id sourceProductId').lean();
+        alreadyOwnedSourceIds = new Set(ownedProducts.map((product) => getCanonicalSourceId(product)));
+    }
+
+    res.json({
+        success: true,
+        products: products.map((product) => {
+            const canonicalSourceId = getCanonicalSourceId(product);
+            return {
+                ...product,
+                canonicalSourceId,
+                alreadyAdded: alreadyOwnedSourceIds.has(canonicalSourceId),
+            };
+        }),
+        total,
+        page: pageNum,
+        pages: Math.ceil(total / limitNum),
+    });
+}));
+
+// GET /api/products/library/:id — fetch source product without mutating stats
+router.get('/library/:id', protect, authorize('vendor', 'admin'), asyncHandler(async (req, res) => {
+    const product = await Product.findById(req.params.id)
+        .populate('vendorId', 'storeName storeLogo city state')
+        .populate('category', 'name slug icon')
+        .populate('categories', 'name slug icon')
+        .lean();
+
+    if (!product) {
+        return res.status(404).json({ success: false, message: 'Product not found' });
+    }
+
+    if (req.user.role === 'vendor') {
+        const vendor = await Vendor.findOne({ userId: req.user._id, approved: true }).select('_id');
+        if (!vendor) {
+            return res.status(403).json({ success: false, message: 'Vendor not approved or not found' });
+        }
+        if (String(product.vendorId?._id || product.vendorId) === String(vendor._id)) {
+            return res.status(403).json({ success: false, message: 'This product is already in your store' });
+        }
+        if (!product.isActive || !product.isApproved) {
+            return res.status(404).json({ success: false, message: 'Product not found' });
+        }
+    }
+
+    res.json({
+        success: true,
+        product: {
+            ...product,
+            canonicalSourceId: getCanonicalSourceId(product),
+        },
+    });
 }));
 
 // GET /api/products/:id
@@ -372,26 +529,44 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     { name: 'images', maxCount: 10 },
     { name: 'variationImages', maxCount: 30 },
 ]), asyncHandler(async (req, res) => {
-    let vendor;
+    let targetVendors = [];
     if (req.user.role === 'vendor') {
-        vendor = await Vendor.findOne({ userId: req.user._id, approved: true });
+        const vendor = await Vendor.findOne({ userId: req.user._id, approved: true });
         if (!vendor) return res.status(403).json({ success: false, message: 'Vendor not approved or not found' });
+        targetVendors = [vendor];
     } else {
-        const vendorId = req.body.vendorId || req.body.vendor;
-        if (!vendorId) return res.status(400).json({ success: false, message: 'vendorId is required for admin product creation' });
-        vendor = await Vendor.findById(vendorId);
-        if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
+        const requestedVendorIds = parseIdList(req.body.vendorIds);
+        const fallbackVendorId = clean(req.body.vendorId || req.body.vendor);
+        const vendorIds = requestedVendorIds.length > 0
+            ? requestedVendorIds
+            : (fallbackVendorId ? [fallbackVendorId] : []);
+
+        if (vendorIds.length === 0) {
+            return res.status(400).json({ success: false, message: 'Select at least one vendor for this product' });
+        }
+
+        targetVendors = await Vendor.find({ _id: { $in: vendorIds } });
+        if (targetVendors.length !== vendorIds.length) {
+            return res.status(404).json({ success: false, message: 'One or more vendors were not found' });
+        }
     }
 
     const { title, description, price, discountPrice, category, subCategory, stock, pincode, tags, sku, unit, weight,
         manageStock, allowBackorders, soldIndividually, taxStatus, taxClass, commissionMode, commissionValue, attributes,
         productType, externalUrl, externalButtonText, variations } = req.body;
     const categoriesRaw = req.body.categories;
-    const categoryList = Array.isArray(categoriesRaw)
-        ? categoriesRaw.filter(Boolean)
-        : categoriesRaw
-            ? String(categoriesRaw).split(',').map((c) => c.trim()).filter(Boolean)
-            : [];
+    const categoryList = parseIdList(categoriesRaw);
+    const sourceProductId = clean(req.body.sourceProductId);
+    let sourceProduct = null;
+
+    if (sourceProductId) {
+        sourceProduct = await Product.findById(sourceProductId).lean();
+        if (!sourceProduct) {
+            return res.status(404).json({ success: false, message: 'Source product not found' });
+        }
+    }
+
+    const canonicalSourceId = sourceProduct ? getCanonicalSourceId(sourceProduct) : null;
 
     const variationUploads = req.files?.variationImages || [];
     let images = (req.files?.images || []).map((f) => toUploadUrl(f)).filter(Boolean) || [];
@@ -400,11 +575,10 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     }
     if (images.length === 0) {
         const rawImageUrls = req.body.imageUrls;
-        if (Array.isArray(rawImageUrls)) {
-            images = rawImageUrls.map((u) => String(u).trim()).filter(Boolean);
-        } else if (typeof rawImageUrls === 'string') {
-            images = rawImageUrls.split(',').map((u) => u.trim()).filter(Boolean);
-        }
+        images = parseStringList(rawImageUrls, /,/);
+    }
+    if (images.length === 0 && sourceProduct?.images?.length) {
+        images = [...sourceProduct.images];
     }
 
     if (images.length === 0) {
@@ -419,43 +593,117 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         });
     }
 
-    const product = await Product.create({
-        vendorId: vendor._id,
-        title, description, price: parseFloat(price),
-        discountPrice: discountPrice ? parseFloat(discountPrice) : undefined,
-        images,
-        category: categoryList[0] || category,
-        categories: categoryList.length ? categoryList : undefined,
-        subCategory,
-        stock: parseInt(stock),
-        location: vendor.location,
-        pincode: pincode || vendor.pincode,
-        city: vendor.city || vendor.address?.city,
-        state: vendor.state || vendor.address?.state,
-        tags: tags ? (Array.isArray(tags) ? tags : tags.split(',').map(t => t.trim())) : [],
-        sku, unit, weight: weight ? parseFloat(weight) : undefined,
-        manageStock: manageStock !== undefined ? manageStock === 'true' || manageStock === true : true,
-        allowBackorders: allowBackorders === 'true' || allowBackorders === true,
-        soldIndividually: soldIndividually === 'true' || soldIndividually === true,
-        taxStatus: taxStatus || 'taxable',
-        taxClass: taxClass || 'standard',
-        commissionMode: commissionMode || undefined,
-        commissionValue: commissionValue ? parseFloat(commissionValue) : undefined,
-        attributes: attributes ? (typeof attributes === 'string' ? JSON.parse(attributes) : attributes) : undefined,
-        productType: productType || 'simple',
-        externalUrl,
-        externalButtonText,
-        variations: parsedVariations.map(v => ({
-            ...v,
-            price: v.price ? parseFloat(v.price) : undefined,
-            discountPrice: v.discountPrice ? parseFloat(v.discountPrice) : undefined,
-            stock: v.stock ? parseInt(v.stock) : 0,
-        })),
+    const parsedAttributes = attributes
+        ? (typeof attributes === 'string' ? JSON.parse(attributes) : attributes)
+        : undefined;
+    const parsedTags = parseStringList(tags, /,/);
+    const priceValue = coerceNumber(price);
+    const discountValue = coerceNumber(discountPrice);
+    const stockValue = coerceNumber(stock);
+    const weightValue = coerceNumber(weight);
+    const commissionValueNum = coerceNumber(commissionValue);
+    const normalizedVariations = parsedVariations.map((variation) => ({
+        ...variation,
+        price: coerceNumber(variation.price),
+        discountPrice: coerceNumber(variation.discountPrice),
+        stock: coerceNumber(variation.stock) ?? 0,
+    }));
+    const titleValue = title || sourceProduct?.title;
+    const descriptionValue = description || sourceProduct?.description;
+    const unitValue = unit || sourceProduct?.unit;
+    const productTypeValue = productType || sourceProduct?.productType || 'simple';
+    const externalUrlValue = externalUrl || sourceProduct?.externalUrl;
+    const externalButtonTextValue = externalButtonText || sourceProduct?.externalButtonText;
+
+    if (!titleValue || !descriptionValue || priceValue === undefined || stockValue === undefined || !(categoryList[0] || category)) {
+        return res.status(400).json({ success: false, message: 'Title, description, price, stock, and category are required' });
+    }
+
+    const duplicateVendors = new Set();
+    if (canonicalSourceId) {
+        const existingAssignments = await Product.find({
+            vendorId: { $in: targetVendors.map((vendor) => vendor._id) },
+            $or: [
+                { _id: canonicalSourceId },
+                { sourceProductId: canonicalSourceId },
+            ],
+        }).select('vendorId').lean();
+        existingAssignments.forEach((product) => duplicateVendors.add(String(product.vendorId)));
+    }
+
+    const payloads = targetVendors
+        .filter((vendor) => !duplicateVendors.has(String(vendor._id)))
+        .map((vendor) => ({
+            vendorId: vendor._id,
+            sourceProductId: canonicalSourceId || undefined,
+            title: titleValue,
+            description: descriptionValue,
+            price: priceValue,
+            discountPrice: discountValue,
+            images,
+            category: categoryList[0] || category,
+            categories: categoryList.length ? categoryList : undefined,
+            subCategory,
+            stock: stockValue,
+            location: vendor.location,
+            pincode: pincode || vendor.pincode,
+            city: vendor.city || vendor.address?.city,
+            state: vendor.state || vendor.address?.state,
+            tags: parsedTags,
+            sku,
+            unit: unitValue,
+            weight: weightValue,
+            manageStock: manageStock !== undefined ? manageStock === 'true' || manageStock === true : true,
+            allowBackorders: allowBackorders === 'true' || allowBackorders === true,
+            soldIndividually: soldIndividually === 'true' || soldIndividually === true,
+            taxStatus: taxStatus || 'taxable',
+            taxClass: taxClass || 'standard',
+            commissionMode: commissionMode || undefined,
+            commissionValue: commissionValueNum,
+            attributes: parsedAttributes,
+            productType: productTypeValue,
+            externalUrl: externalUrlValue,
+            externalButtonText: externalButtonTextValue,
+            variations: normalizedVariations,
+        }));
+
+    if (payloads.length === 0) {
+        return res.status(409).json({
+            success: false,
+            message: 'This product is already assigned to the selected vendor(s)',
+        });
+    }
+
+    const createdProducts = await Product.create(payloads);
+    const createdList = Array.isArray(createdProducts) ? createdProducts : [createdProducts];
+
+    await Vendor.updateMany(
+        { _id: { $in: createdList.map((product) => product.vendorId) } },
+        { $inc: { totalProducts: 1 } },
+    );
+
+    const skippedVendorIds = targetVendors
+        .filter((vendor) => duplicateVendors.has(String(vendor._id)))
+        .map((vendor) => String(vendor._id));
+    const skippedVendors = targetVendors
+        .filter((vendor) => duplicateVendors.has(String(vendor._id)))
+        .map((vendor) => ({ _id: vendor._id, storeName: vendor.storeName }));
+    const assignedVendors = targetVendors
+        .filter((vendor) => !duplicateVendors.has(String(vendor._id)))
+        .map((vendor) => ({ _id: vendor._id, storeName: vendor.storeName }));
+
+    res.status(201).json({
+        success: true,
+        product: createdList.length === 1 ? createdList[0] : undefined,
+        products: createdList,
+        createdCount: createdList.length,
+        skippedVendorIds,
+        skippedVendors,
+        assignedVendors,
+        message: skippedVendorIds.length > 0
+            ? `${createdList.length} product(s) added. ${skippedVendorIds.length} vendor(s) already had this product.`
+            : `${createdList.length} product(s) added successfully.`,
     });
-
-    await Vendor.findByIdAndUpdate(vendor._id, { $inc: { totalProducts: 1 } });
-
-    res.status(201).json({ success: true, product });
 }));
 
 // PUT /api/products/:id — vendor edits product
@@ -497,25 +745,51 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     } else {
         delete updates.vendorId; // vendors cannot reassign product owner
     }
-    if (req.files?.images?.length > 0) updates.images = req.files.images.map((f) => toUploadUrl(f)).filter(Boolean);
-    else if (variationUploads.length > 0 && !updates.imageUrls) updates.images = variationUploads.map((f) => toUploadUrl(f)).filter(Boolean);
-    if (updates.price) updates.price = parseFloat(updates.price);
-    if (updates.discountPrice) updates.discountPrice = parseFloat(updates.discountPrice);
-    if (updates.stock) updates.stock = parseInt(updates.stock);
-    if (updates.weight) updates.weight = parseFloat(updates.weight);
-    if (updates.manageStock !== undefined) updates.manageStock = updates.manageStock === 'true' || updates.manageStock === true;
-    if (updates.allowBackorders !== undefined) updates.allowBackorders = updates.allowBackorders === 'true' || updates.allowBackorders === true;
-    if (updates.soldIndividually !== undefined) updates.soldIndividually = updates.soldIndividually === 'true' || updates.soldIndividually === true;
-    if (updates.commissionValue) updates.commissionValue = parseFloat(updates.commissionValue);
+    // Images: prefer uploaded files, else URLs (string or array)
+    if (req.files?.images?.length > 0) {
+        updates.images = req.files.images.map((f) => toUploadUrl(f)).filter(Boolean);
+    } else if (variationUploads.length > 0 && !updates.imageUrls) {
+        updates.images = variationUploads.map((f) => toUploadUrl(f)).filter(Boolean);
+    } else if (updates.imageUrls) {
+        const raw = updates.imageUrls;
+        const urlList = Array.isArray(raw)
+            ? raw.map((u) => String(u).trim()).filter(Boolean)
+            : String(raw)
+                .split(',')
+                .map((u) => u.trim())
+                .filter(Boolean);
+        if (urlList.length > 0) updates.images = urlList;
+    }
+    delete updates.imageUrls;
+
+    // Numeric + boolean coercions (allow zero/false)
+    const priceNum = coerceNumber(updates.price);
+    if (priceNum !== undefined) updates.price = priceNum;
+    const discountNum = coerceNumber(updates.discountPrice);
+    if (discountNum !== undefined) updates.discountPrice = discountNum;
+    const stockNum = coerceNumber(updates.stock);
+    if (stockNum !== undefined) updates.stock = stockNum;
+    const weightNum = coerceNumber(updates.weight);
+    if (weightNum !== undefined) updates.weight = weightNum;
+    const commissionNum = coerceNumber(updates.commissionValue);
+    if (commissionNum !== undefined) updates.commissionValue = commissionNum;
+
+    const manageStockBool = coerceBoolean(updates.manageStock);
+    if (manageStockBool !== undefined) updates.manageStock = manageStockBool;
+    const allowBackordersBool = coerceBoolean(updates.allowBackorders);
+    if (allowBackordersBool !== undefined) updates.allowBackorders = allowBackordersBool;
+    const soldIndividuallyBool = coerceBoolean(updates.soldIndividually);
+    if (soldIndividuallyBool !== undefined) updates.soldIndividually = soldIndividuallyBool;
+
     if (updates.attributes && typeof updates.attributes === 'string') updates.attributes = JSON.parse(updates.attributes);
     if (updates.productType) updates.productType = updates.productType;
     if (updates.variations && typeof updates.variations === 'string') updates.variations = JSON.parse(updates.variations);
     if (Array.isArray(updates.variations)) {
         updates.variations = updates.variations.map((v) => ({
             ...v,
-            price: v.price ? parseFloat(v.price) : undefined,
-            discountPrice: v.discountPrice ? parseFloat(v.discountPrice) : undefined,
-            stock: v.stock ? parseInt(v.stock) : 0,
+            price: coerceNumber(v.price),
+            discountPrice: coerceNumber(v.discountPrice),
+            stock: coerceNumber(v.stock) ?? 0,
         }));
         if (variationUploads.length > 0) {
             variationUploads.forEach((file, idx) => {
@@ -525,7 +799,21 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         }
     }
 
-    const updated = await Product.findByIdAndUpdate(req.params.id, updates, { new: true, runValidators: true });
+    // Business validation: discount must be below price (use existing price if not provided)
+    const effectivePrice = updates.price !== undefined ? updates.price : product.price;
+    const effectiveDiscount = updates.discountPrice !== undefined ? updates.discountPrice : product.discountPrice;
+    if (effectiveDiscount !== undefined && effectivePrice !== undefined && effectiveDiscount >= effectivePrice) {
+        return res.status(400).json({
+            success: false,
+            message: 'Discount price must be less than original price',
+        });
+    }
+
+    const updated = await Product.findByIdAndUpdate(
+        req.params.id,
+        updates,
+        { new: true, runValidators: true, context: 'query' },
+    );
     if (targetVendor) {
         await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
         await Vendor.findByIdAndUpdate(targetVendor._id, { $inc: { totalProducts: 1 } });

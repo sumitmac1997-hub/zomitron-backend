@@ -6,10 +6,12 @@ const Vendor = require('../models/Vendor');
 const Product = require('../models/Product');
 const Order = require('../models/Order');
 const Category = require('../models/Category');
+const ShippingRule = require('../models/ShippingRule');
 const { protect, authorize } = require('../middleware/auth');
 const { geocodePincode } = require('../utils/geocode');
 const { uploadVendor, toUploadUrl } = require('../config/cloudinary');
 const { buildInvoicePdf } = require('../utils/pdfInvoice');
+const { normalizeCity, parsePincodeRanges, serializeShippingRule } = require('../utils/shippingRules');
 
 // All admin routes require auth + admin role
 router.use(protect, authorize('admin'));
@@ -259,6 +261,105 @@ router.post('/payouts/:vendorId', asyncHandler(async (req, res) => {
     });
 
     res.json({ success: true, message: `Payout of ₹${amount} processed for ${vendor.storeName}` });
+}));
+
+// GET /api/admin/shipping-rules
+router.get('/shipping-rules', asyncHandler(async (req, res) => {
+    const rules = await ShippingRule.find({})
+        .sort({ cityNormalized: 1, createdAt: -1 })
+        .lean();
+
+    res.json({
+        success: true,
+        rules: rules.map((rule) => serializeShippingRule(rule)),
+    });
+}));
+
+// POST /api/admin/shipping-rules
+router.post('/shipping-rules', asyncHandler(async (req, res) => {
+    const {
+        city,
+        pincodeRanges,
+        pincodeRangesText,
+        freeShippingThreshold = 0,
+        shippingCharge,
+        isActive = true,
+    } = req.body;
+
+    if (!String(city || '').trim()) {
+        return res.status(400).json({ success: false, message: 'City is required' });
+    }
+
+    if (shippingCharge === undefined || Number(shippingCharge) < 0) {
+        return res.status(400).json({ success: false, message: 'Shipping charge must be 0 or more' });
+    }
+
+    if (Number(freeShippingThreshold) < 0) {
+        return res.status(400).json({ success: false, message: 'Free shipping threshold must be 0 or more' });
+    }
+
+    const rule = await ShippingRule.create({
+        city: String(city).trim(),
+        cityNormalized: normalizeCity(city),
+        pincodeRanges: parsePincodeRanges(pincodeRangesText || pincodeRanges),
+        freeShippingThreshold: Number(freeShippingThreshold) || 0,
+        shippingCharge: Number(shippingCharge) || 0,
+        isActive: isActive !== false && isActive !== 'false',
+        createdBy: req.user._id,
+    });
+
+    res.status(201).json({
+        success: true,
+        rule: serializeShippingRule(rule.toObject()),
+        message: 'Shipping rule created',
+    });
+}));
+
+// PUT /api/admin/shipping-rules/:id
+router.put('/shipping-rules/:id', asyncHandler(async (req, res) => {
+    const {
+        city,
+        pincodeRanges,
+        pincodeRangesText,
+        freeShippingThreshold = 0,
+        shippingCharge,
+        isActive = true,
+    } = req.body;
+
+    if (!String(city || '').trim()) {
+        return res.status(400).json({ success: false, message: 'City is required' });
+    }
+
+    if (shippingCharge === undefined || Number(shippingCharge) < 0) {
+        return res.status(400).json({ success: false, message: 'Shipping charge must be 0 or more' });
+    }
+
+    if (Number(freeShippingThreshold) < 0) {
+        return res.status(400).json({ success: false, message: 'Free shipping threshold must be 0 or more' });
+    }
+
+    const rule = await ShippingRule.findByIdAndUpdate(
+        req.params.id,
+        {
+            city: String(city).trim(),
+            cityNormalized: normalizeCity(city),
+            pincodeRanges: parsePincodeRanges(pincodeRangesText || pincodeRanges),
+            freeShippingThreshold: Number(freeShippingThreshold) || 0,
+            shippingCharge: Number(shippingCharge) || 0,
+            isActive: isActive !== false && isActive !== 'false',
+        },
+        { new: true, runValidators: true }
+    ).lean();
+
+    if (!rule) {
+        return res.status(404).json({ success: false, message: 'Shipping rule not found' });
+    }
+
+    res.json({
+        success: true,
+        rule: serializeShippingRule(rule),
+        message: 'Shipping rule updated',
+    });
 }));
 
 // GET /api/admin/users

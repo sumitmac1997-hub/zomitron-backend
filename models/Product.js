@@ -7,6 +7,10 @@ const productSchema = new mongoose.Schema(
             ref: 'Vendor',
             required: true,
         },
+        sourceProductId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Product',
+        },
         title: {
             type: String,
             required: [true, 'Product title is required'],
@@ -29,7 +33,15 @@ const productSchema = new mongoose.Schema(
             type: Number,
             min: [0, 'Discount price cannot be negative'],
             validate: {
-                validator: function (v) { return !v || v < this.price; },
+                validator: function (v) {
+                    // Works for both document saves and update queries
+                    if (v === null || v === undefined) return true;
+                    const update = typeof this.getUpdate === 'function' ? this.getUpdate() : null;
+                    const priceFromUpdate = update ? (update.$set?.price ?? update.price) : undefined;
+                    const price = this.price ?? priceFromUpdate;
+                    if (price === null || price === undefined) return true; // cannot compare, skip
+                    return v < price;
+                },
                 message: 'Discount price must be less than original price',
             },
         },
@@ -124,6 +136,7 @@ const productSchema = new mongoose.Schema(
 // CRITICAL: 2dsphere geospatial index for $geoNear queries
 productSchema.index({ location: '2dsphere' });
 productSchema.index({ vendorId: 1, isActive: 1 });
+productSchema.index({ sourceProductId: 1, vendorId: 1 });
 productSchema.index({ categories: 1 });
 productSchema.index({ title: 'text', description: 'text', tags: 'text' }); // Full-text search
 productSchema.index({ price: 1 });

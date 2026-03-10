@@ -6,10 +6,12 @@ const Product = require('../models/Product');
 const Vendor = require('../models/Vendor');
 const Coupon = require('../models/Coupon');
 const User = require('../models/User');
+const ShippingRule = require('../models/ShippingRule');
 const { protect, optionalAuth, authorize } = require('../middleware/auth');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo, getEstimatedDeliveryDate } = require('../utils/deliveryETA');
 const { calculateMultiVendorPayouts } = require('../utils/commission');
+const { normalizeCity, calculateShippingQuote } = require('../utils/shippingRules');
 
 // POST /api/orders — Create order
 router.post('/', optionalAuth, asyncHandler(async (req, res) => {
@@ -52,7 +54,7 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
 
     // Calculate delivery info (use first vendor location vs delivery address)
     let deliveryDistance = 0;
-    let deliveryInfo = { eta: '3-5 days', etaLabel: 'Standard Delivery', deliveryCharge: 50 };
+    let deliveryInfo = { eta: '3-5 days', etaLabel: 'Standard Delivery', deliveryCharge: 0 };
     if (deliveryAddress.lat && deliveryAddress.lng && vendors[0]?.location?.coordinates) {
         const [vendorLng, vendorLat] = vendors[0].location.coordinates;
         deliveryDistance = haversineDistance(deliveryAddress.lat, deliveryAddress.lng, vendorLat, vendorLng);
@@ -74,7 +76,25 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
     }
 
     const { platformTotal, vendorPayouts } = calculateMultiVendorPayouts(orderItems, commissionRates);
-    const total = Math.max(0, subtotal - discount + deliveryInfo.deliveryCharge);
+    const cityNormalized = normalizeCity(deliveryAddress.city);
+    const shippingRules = await ShippingRule.find(
+        cityNormalized ? { isActive: true, cityNormalized } : { isActive: true }
+    ).sort({ updatedAt: -1 }).lean();
+    const shippingQuote = calculateShippingQuote({
+        city: deliveryAddress.city,
+        pincode: deliveryAddress.pincode,
+        subtotal,
+        discount,
+    }, shippingRules);
+
+    if (!shippingQuote.matched) {
+        return res.status(400).json({
+            success: false,
+            message: 'Service is not available in this city',
+        });
+    }
+
+    const total = Math.max(0, subtotal - discount + shippingQuote.shippingCharge);
 
     // Create order
     const order = await Order.create({
@@ -85,7 +105,7 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         vendorIds: vendorIdArray,
         subtotal,
         platformFee: platformTotal,
-        deliveryCharge: deliveryInfo.deliveryCharge,
+        deliveryCharge: shippingQuote.shippingCharge,
         discount,
         total,
         vendorPayouts,
@@ -96,6 +116,15 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         deliveryETA: deliveryInfo.eta,
         estimatedDelivery: getEstimatedDeliveryDate(deliveryDistance),
         deliveryDistance,
+        shippingRule: {
+            ruleId: shippingQuote.ruleId,
+            city: shippingQuote.city || deliveryAddress.city,
+            freeShippingThreshold: shippingQuote.freeShippingThreshold,
+            baseShippingCharge: shippingQuote.baseShippingCharge,
+            appliedCharge: shippingQuote.shippingCharge,
+            matchingMode: shippingQuote.matchingMode,
+            pincodeRangesText: shippingQuote.pincodeRangesText,
+        },
         vendorFulfillments: vendorIdArray.map(vid => ({ vendorId: vid, status: 'pending' })),
     });
 
@@ -121,7 +150,14 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         io.emitToAdmin('newOrder', { orderId: order._id, total });
     }
 
-    res.status(201).json({ success: true, order: { ...order.toObject(), deliveryInfo } });
+    res.status(201).json({
+        success: true,
+        order: {
+            ...order.toObject(),
+            deliveryInfo: { ...deliveryInfo, deliveryCharge: shippingQuote.shippingCharge },
+            shippingQuote,
+        },
+    });
 }));
 
 // GET /api/orders/my — Customer order history
@@ -162,7 +198,16 @@ router.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
         }
     }
 
-    res.json({ success: true, order: { ...order, deliveryInfo: getDeliveryInfo(order.deliveryDistance || 0) } });
+    res.json({
+        success: true,
+        order: {
+            ...order,
+            deliveryInfo: {
+                ...getDeliveryInfo(order.deliveryDistance || 0),
+                deliveryCharge: order.deliveryCharge || 0,
+            },
+        },
+    });
 }));
 
 // PUT /api/orders/:id/status — Admin update order status
@@ -250,7 +295,16 @@ router.get('/:id/track', asyncHandler(async (req, res) => {
         .select('orderStatus trackingCode trackingUrl deliveryETA estimatedDelivery vendorFulfillments deliveryAddress deliveryDistance')
         .lean();
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
-    res.json({ success: true, tracking: { ...order, deliveryInfo: getDeliveryInfo(order.deliveryDistance || 0) } });
+    res.json({
+        success: true,
+        tracking: {
+            ...order,
+            deliveryInfo: {
+                ...getDeliveryInfo(order.deliveryDistance || 0),
+                deliveryCharge: order.deliveryCharge || 0,
+            },
+        },
+    });
 }));
 
 module.exports = router;

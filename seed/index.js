@@ -9,7 +9,11 @@ const Product = require('../models/Product');
 const Category = require('../models/Category');
 const Pincode = require('../models/Pincode');
 
-const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/zomitron';
+const MONGO_URI = process.env.MONGO_URI;
+const MONGO_DB_NAME = process.env.MONGO_DB_NAME || 'zomitron';
+if (!MONGO_URI) {
+    throw new Error('MONGO_URI is not set. Update backend/.env with your Atlas connection string.');
+}
 
 // ─── Helper: generate slug ────────────────────────────────────────────────────
 const slugify = (text) =>
@@ -66,8 +70,8 @@ const vendorUsersData = [
 
 const seed = async () => {
     try {
-        await mongoose.connect(MONGO_URI);
-        console.log('✅ Connected to MongoDB');
+        await mongoose.connect(MONGO_URI, { dbName: MONGO_DB_NAME, appName: process.env.MONGO_APP_NAME || 'zomitron-seed' });
+        console.log(`✅ Connected to MongoDB (${MONGO_DB_NAME})`);
 
         // Drop all collections cleanly (avoids stale indexes)
         console.log('🗑️  Clearing existing data...');
