@@ -4,6 +4,7 @@ const asyncHandler = require('express-async-handler');
 const Product = require('../models/Product');
 const Vendor = require('../models/Vendor');
 const Category = require('../models/Category');
+const TaxClass = require('../models/TaxClass');
 const { protect, authorize } = require('../middleware/auth');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo } = require('../utils/deliveryETA');
@@ -619,6 +620,12 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         return res.status(400).json({ success: false, message: 'Title, description, price, stock, and category are required' });
     }
 
+    const taxClassCode = (taxClass || 'standard').toString().toLowerCase();
+    if (!['standard', 'zero'].includes(taxClassCode)) {
+        const tax = await TaxClass.findOne({ code: taxClassCode, isActive: true });
+        if (!tax) return res.status(400).json({ success: false, message: 'Invalid tax class selected' });
+    }
+
     const duplicateVendors = new Set();
     if (canonicalSourceId) {
         const existingAssignments = await Product.find({
@@ -657,7 +664,7 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
             allowBackorders: allowBackorders === 'true' || allowBackorders === true,
             soldIndividually: soldIndividually === 'true' || soldIndividually === true,
             taxStatus: taxStatus || 'taxable',
-            taxClass: taxClass || 'standard',
+            taxClass: taxClassCode,
             commissionMode: commissionMode || undefined,
             commissionValue: commissionValueNum,
             attributes: parsedAttributes,
@@ -722,6 +729,13 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     }
 
     const updates = { ...req.body };
+    if (updates.taxClass) {
+        updates.taxClass = String(updates.taxClass).trim().toLowerCase();
+        if (!['standard', 'zero'].includes(updates.taxClass)) {
+            const tax = await TaxClass.findOne({ code: updates.taxClass, isActive: true });
+            if (!tax) return res.status(400).json({ success: false, message: 'Invalid tax class selected' });
+        }
+    }
     const categoriesRaw = updates.categories;
     if (categoriesRaw !== undefined) {
         const categoryList = Array.isArray(categoriesRaw)

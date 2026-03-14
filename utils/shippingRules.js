@@ -46,37 +46,25 @@ const isPincodeInRanges = (pincode, ranges = []) => {
     ));
 };
 
-const pickShippingRule = ({ city, pincode }, rules = []) => {
+// Simplified matcher: prefer city match; ignore pincode unless no city rule exists.
+const pickShippingRule = ({ city }, rules = []) => {
     const cityNormalized = normalizeCity(city);
-    const normalizedPincode = normalizePincode(pincode);
+    const activeRules = rules.filter((rule) => rule?.isActive !== false);
 
-    const matches = rules
-        .filter((rule) => rule?.isActive !== false)
-        .map((rule) => {
-            const ruleCity = normalizeCity(rule.cityNormalized || rule.city);
-            const ranges = parsePincodeRanges(rule.pincodeRanges);
-            const hasRanges = ranges.length > 0;
+    // 1) Exact city match (first active)
+    const cityRule = activeRules.find((rule) => normalizeCity(rule.cityNormalized || rule.city) === cityNormalized);
+    if (cityRule) return { rule: cityRule, ranges: parsePincodeRanges(cityRule.pincodeRanges), priority: 3 };
 
-            if (cityNormalized && ruleCity && ruleCity !== cityNormalized) return null;
-            if (!cityNormalized && !hasRanges) return null;
-            if (hasRanges && !isPincodeInRanges(normalizedPincode, ranges)) return null;
+    // 2) Wildcard rule
+    const wildcardRule = activeRules.find((rule) => normalizeCity(rule.cityNormalized || rule.city) === '*');
+    if (wildcardRule) return { rule: wildcardRule, ranges: parsePincodeRanges(wildcardRule.pincodeRanges), priority: 1 };
 
-            return {
-                rule,
-                ranges,
-                priority: hasRanges ? 2 : 1,
-            };
-        })
-        .filter(Boolean)
-        .sort((a, b) => {
-            if (b.priority !== a.priority) return b.priority - a.priority;
-
-            const aUpdated = new Date(a.rule.updatedAt || a.rule.createdAt || 0).getTime();
-            const bUpdated = new Date(b.rule.updatedAt || b.rule.createdAt || 0).getTime();
-            return bUpdated - aUpdated;
-        });
-
-    return matches[0] || null;
+    // 3) Any active rule fallback
+    if (activeRules.length > 0) {
+        const fallback = activeRules[0];
+        return { rule: fallback, ranges: parsePincodeRanges(fallback.pincodeRanges), priority: 0 };
+    }
+    return null;
 };
 
 const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, rules = []) => {
@@ -84,27 +72,26 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
     const matched = pickShippingRule({ city, pincode }, rules);
 
     if (!matched) {
+        // Always allow ordering even if no rule exists; default to free shipping.
         return {
             shippingCharge: 0,
             baseShippingCharge: 0,
             freeShippingThreshold: 0,
             orderValue,
             isChargeApplied: false,
-            matched: false,
-            serviceAvailable: false,
-            matchingMode: null,
+            matched: true,
+            serviceAvailable: true,
+            matchingMode: 'none',
             ruleId: null,
             city: normalizeCity(city),
             pincodeRangesText: '',
-            message: 'Service is not available in this city',
+            message: '',
         };
     }
 
     const baseShippingCharge = Math.max(0, Number(matched.rule.shippingCharge || 0));
     const freeShippingThreshold = Math.max(0, Number(matched.rule.freeShippingThreshold || 0));
-    const isChargeApplied = freeShippingThreshold > 0
-        ? orderValue < freeShippingThreshold
-        : baseShippingCharge > 0;
+    const isChargeApplied = orderValue < freeShippingThreshold;
 
     return {
         shippingCharge: isChargeApplied ? baseShippingCharge : 0,
@@ -114,7 +101,7 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
         isChargeApplied,
         matched: true,
         serviceAvailable: true,
-        matchingMode: matched.priority === 2 ? 'pincode' : 'city',
+        matchingMode: matched.priority >= 2 ? 'city' : 'fallback',
         ruleId: matched.rule._id || null,
         city: matched.rule.city,
         pincodeRangesText: formatPincodeRanges(matched.ranges),

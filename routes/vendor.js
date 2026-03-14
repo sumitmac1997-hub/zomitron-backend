@@ -144,9 +144,15 @@ router.post('/register', protect, asyncHandler(async (req, res) => {
     // Update user role to vendor
     await User.findByIdAndUpdate(req.user._id, { role: 'vendor' });
 
-    // Notify admin via io
+    // Notify admin via db + io
     const io = req.app.get('io');
-    if (io) io.emitToAdmin('newVendorRequest', { vendor });
+    const { notifyAdmin } = require('../utils/adminNotificationEngine');
+    await notifyAdmin(io, {
+        type: 'new_vendor',
+        message: `New Vendor Application: ${storeName}`,
+        link: '/admin/vendors',
+        relatedId: vendor._id
+    });
 
     res.status(201).json({
         success: true,

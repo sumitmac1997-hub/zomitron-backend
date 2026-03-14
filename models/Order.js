@@ -85,6 +85,17 @@ const orderSchema = new mongoose.Schema(
         deliveredAt: Date,
         cancelledAt: Date,
         cancellationReason: String,
+        // Refunds
+        refundStatus: {
+            type: String,
+            enum: ['none', 'requested', 'approved', 'rejected', 'processed'],
+            default: 'none',
+        },
+        refundRequestedAt: Date,
+        refundProcessedAt: Date,
+        refundReason: String,
+        refundResponse: String,
+        refundWindowDays: { type: Number, default: 5 },
         // Fulfillment per vendor
         vendorFulfillments: [
             {

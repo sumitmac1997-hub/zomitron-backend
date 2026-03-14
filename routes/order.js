@@ -12,6 +12,20 @@ const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo, getEstimatedDeliveryDate } = require('../utils/deliveryETA');
 const { calculateMultiVendorPayouts } = require('../utils/commission');
 const { normalizeCity, calculateShippingQuote } = require('../utils/shippingRules');
+const { getSettingValue } = require('../utils/settings');
+
+const ensureDefaultShippingRule = async () => {
+    const existing = await ShippingRule.findOne({ isActive: true });
+    if (existing) return;
+    await ShippingRule.create({
+        city: '*',
+        cityNormalized: '*',
+        pincodeRanges: [{ start: '000000', end: '999999' }],
+        shippingCharge: 0,
+        freeShippingThreshold: 0,
+        isActive: true,
+    });
+};
 
 // POST /api/orders — Create order
 router.post('/', optionalAuth, asyncHandler(async (req, res) => {
@@ -76,25 +90,20 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
     }
 
     const { platformTotal, vendorPayouts } = calculateMultiVendorPayouts(orderItems, commissionRates);
-    const cityNormalized = normalizeCity(deliveryAddress.city);
-    const shippingRules = await ShippingRule.find(
-        cityNormalized ? { isActive: true, cityNormalized } : { isActive: true }
-    ).sort({ updatedAt: -1 }).lean();
+    await ensureDefaultShippingRule();
+
+    // Fetch all active rules and let matcher decide
+    const ruleList = await ShippingRule.find({ isActive: true }).sort({ updatedAt: -1 }).lean();
+
     const shippingQuote = calculateShippingQuote({
         city: deliveryAddress.city,
         pincode: deliveryAddress.pincode,
         subtotal,
         discount,
-    }, shippingRules);
-
-    if (!shippingQuote.matched) {
-        return res.status(400).json({
-            success: false,
-            message: 'Service is not available in this city',
-        });
-    }
+    }, ruleList);
 
     const total = Math.max(0, subtotal - discount + shippingQuote.shippingCharge);
+    const refundWindowDays = await getSettingValue('refundWindowDays', 5);
 
     // Create order
     const order = await Order.create({
@@ -126,6 +135,7 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
             pincodeRangesText: shippingQuote.pincodeRangesText,
         },
         vendorFulfillments: vendorIdArray.map(vid => ({ vendorId: vid, status: 'pending' })),
+        refundWindowDays: Number(refundWindowDays) || 5,
     });
 
     // Reduce stock
@@ -147,8 +157,16 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
     const io = req.app.get('io');
     if (io) {
         vendors.forEach(v => io.emitToVendor(v._id.toString(), 'newOrder', { orderId: order._id, orderNumber: order.orderNumber }));
-        io.emitToAdmin('newOrder', { orderId: order._id, total });
     }
+    
+    // Notify admin
+    const { notifyAdmin } = require('../utils/adminNotificationEngine');
+    await notifyAdmin(io, {
+        type: 'order_placed',
+        message: `New Order Placed: #${order.orderNumber} (₹${total})`,
+        link: `/admin/dashboard`,
+        relatedId: order._id
+    });
 
     res.status(201).json({
         success: true,
@@ -198,10 +216,26 @@ router.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
         }
     }
 
+    const refundWindowDays = order.refundWindowDays || await getSettingValue('refundWindowDays', 5);
+    const refundEndsOn = order.deliveredAt
+        ? new Date(new Date(order.deliveredAt).getTime() + Number(refundWindowDays || 0) * 24 * 60 * 60 * 1000)
+        : null;
+    const now = new Date();
+    const canCancel = !['delivered', 'cancelled'].includes(order.orderStatus);
+    const canRefund = order.orderStatus === 'delivered'
+        && order.refundStatus === 'none'
+        && order.deliveredAt
+        && refundEndsOn
+        && now <= refundEndsOn;
+
     res.json({
         success: true,
         order: {
             ...order,
+            refundWindowDays: Number(refundWindowDays) || 5,
+            refundEndsOn,
+            canCancel,
+            canRefund,
             deliveryInfo: {
                 ...getDeliveryInfo(order.deliveryDistance || 0),
                 deliveryCharge: order.deliveryCharge || 0,
@@ -276,7 +310,7 @@ router.post('/:id/cancel', protect, asyncHandler(async (req, res) => {
     const { reason } = req.body;
     const order = await Order.findOne({ _id: req.params.id, customerId: req.user._id });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
-    if (!['pending', 'confirmed'].includes(order.orderStatus)) {
+    if (['delivered', 'cancelled', 'returned'].includes(order.orderStatus)) {
         return res.status(400).json({ success: false, message: 'Order cannot be cancelled at this stage' });
     }
     order.orderStatus = 'cancelled';
@@ -286,7 +320,53 @@ router.post('/:id/cancel', protect, asyncHandler(async (req, res) => {
         await Product.findByIdAndUpdate(item.productId, { $inc: { stock: item.qty } });
     }
     await order.save();
+
+    const { notifyAdmin } = require('../utils/adminNotificationEngine');
+    await notifyAdmin(req.app.get('io'), {
+        type: 'order_cancelled',
+        message: `Order Cancelled: #${order.orderNumber}`,
+        link: `/admin/dashboard`,
+        relatedId: order._id
+    });
+
     res.json({ success: true, message: 'Order cancelled', order });
+}));
+
+// POST /api/orders/:id/refund — Customer requests refund (within window)
+router.post('/:id/refund', protect, asyncHandler(async (req, res) => {
+    const { reason } = req.body;
+    const order = await Order.findOne({ _id: req.params.id, customerId: req.user._id });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (order.orderStatus !== 'delivered') {
+        return res.status(400).json({ success: false, message: 'Refunds are available only after delivery' });
+    }
+    if (order.refundStatus && order.refundStatus !== 'none') {
+        return res.status(400).json({ success: false, message: 'Refund already requested' });
+    }
+    if (!order.deliveredAt) {
+        return res.status(400).json({ success: false, message: 'Delivered timestamp missing, contact support' });
+    }
+
+    const refundWindowDays = order.refundWindowDays || await getSettingValue('refundWindowDays', 5);
+    const lastRefundDate = new Date(order.deliveredAt.getTime() + Number(refundWindowDays || 0) * 24 * 60 * 60 * 1000);
+    if (new Date() > lastRefundDate) {
+        return res.status(400).json({ success: false, message: 'Refund window has expired' });
+    }
+
+    order.refundStatus = 'requested';
+    order.refundReason = reason;
+    order.refundRequestedAt = new Date();
+    await order.save();
+
+    const { notifyAdmin } = require('../utils/adminNotificationEngine');
+    await notifyAdmin(req.app.get('io'), {
+        type: 'refund_requested',
+        message: `Refund Requested: #${order.orderNumber}`,
+        link: `/admin/refunds`,
+        relatedId: order._id
+    });
+
+    res.json({ success: true, message: 'Refund requested', order });
 }));
 
 // GET /api/orders/:id/track — Real-time tracking info

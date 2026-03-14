@@ -56,6 +56,15 @@ router.post('/register', asyncHandler(async (req, res) => {
 
     const { accessToken, refreshToken } = generateTokens(user._id);
     await User.findByIdAndUpdate(user._id, { refreshToken });
+    
+    // Notify admin
+    const { notifyAdmin } = require('../utils/adminNotificationEngine');
+    await notifyAdmin(req.app.get('io'), {
+        type: 'new_customer',
+        message: `New user joined: ${user.name}`,
+        link: '/admin/users',
+        relatedId: user._id
+    });
 
     res.status(201).json({
         success: true,

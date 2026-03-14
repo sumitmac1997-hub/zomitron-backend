@@ -7,6 +7,9 @@ const Product = require('../models/Product');
 const Order = require('../models/Order');
 const Category = require('../models/Category');
 const ShippingRule = require('../models/ShippingRule');
+const Setting = require('../models/Setting');
+const AdminNotification = require('../models/AdminNotification');
+const { getSettingValue, setSettingValue } = require('../utils/settings');
 const { protect, authorize } = require('../middleware/auth');
 const { geocodePincode } = require('../utils/geocode');
 const { uploadVendor, toUploadUrl } = require('../config/cloudinary');
@@ -362,6 +365,63 @@ router.put('/shipping-rules/:id', asyncHandler(async (req, res) => {
     });
 }));
 
+// GET /api/admin/refund-settings — current window in days
+router.get('/refund-settings', asyncHandler(async (_req, res) => {
+    const days = await getSettingValue('refundWindowDays', 5);
+    res.json({ success: true, days: Number(days) || 5 });
+}));
+
+// PUT /api/admin/refund-settings — update refund window (days)
+router.put('/refund-settings', asyncHandler(async (req, res) => {
+    const days = Number(req.body.days);
+    if (Number.isNaN(days) || days < 0 || days > 365) {
+        return res.status(400).json({ success: false, message: 'Refund window must be between 0 and 365 days' });
+    }
+    const setting = await setSettingValue('refundWindowDays', Math.round(days), req.user._id);
+    res.json({ success: true, days: setting.value });
+}));
+
+// GET /api/admin/refunds — list refund requests
+router.get('/refunds', asyncHandler(async (req, res) => {
+    const { status } = req.query;
+    const query = { refundStatus: { $ne: 'none' } };
+    if (status) query.refundStatus = status;
+
+    const orders = await Order.find(query)
+        .populate('customerId', 'name email')
+        .populate('vendorIds', 'storeName')
+        .sort({ updatedAt: -1 })
+        .limit(200)
+        .lean();
+
+    res.json({ success: true, orders });
+}));
+
+// PUT /api/admin/refunds/:id — update refund status
+router.put('/refunds/:id', asyncHandler(async (req, res) => {
+    const { status, responseNote } = req.body;
+    const allowed = ['requested', 'approved', 'rejected', 'processed'];
+    if (!allowed.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid refund status' });
+    }
+
+    const order = await Order.findById(req.params.id);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+
+    order.refundStatus = status;
+    order.refundResponse = responseNote;
+    if (status === 'processed' || status === 'approved') {
+        order.paymentStatus = 'refunded';
+        order.refundProcessedAt = new Date();
+    }
+    if (status === 'rejected') {
+        order.paymentStatus = order.paymentStatus === 'refunded' ? 'paid' : order.paymentStatus;
+    }
+
+    await order.save();
+    res.json({ success: true, order });
+}));
+
 // GET /api/admin/users
 router.get('/users', asyncHandler(async (req, res) => {
     const { page = 1, limit = 20, role, search, from, to } = req.query;
@@ -394,6 +454,35 @@ router.get('/analytics/sales-by-region', asyncHandler(async (req, res) => {
         { $sort: { total: -1 } }, { $limit: 20 },
     ]);
     res.json({ success: true, stats });
+}));
+
+// GET /api/admin/notifications — Fetch recently generated admin alerts
+router.get('/notifications', asyncHandler(async (req, res) => {
+    const { limit = 50 } = req.query;
+    const notifications = await AdminNotification.find()
+        .sort({ createdAt: -1 })
+        .limit(parseInt(limit))
+        .lean();
+    
+    const unreadCount = await AdminNotification.countDocuments({ isRead: false });
+
+    res.json({ success: true, notifications, unreadCount });
+}));
+
+// PUT /api/admin/notifications/read-all
+router.put('/notifications/read-all', asyncHandler(async (req, res) => {
+    await AdminNotification.updateMany({ isRead: false }, { isRead: true });
+    res.json({ success: true, message: 'All notifications marked as read' });
+}));
+
+// PUT /api/admin/notifications/:id/read
+router.put('/notifications/:id/read', asyncHandler(async (req, res) => {
+    const notification = await AdminNotification.findByIdAndUpdate(
+        req.params.id,
+        { isRead: true },
+        { new: true }
+    );
+    res.json({ success: true, notification });
 }));
 
 module.exports = router;
