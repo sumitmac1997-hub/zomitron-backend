@@ -46,24 +46,32 @@ const isPincodeInRanges = (pincode, ranges = []) => {
     ));
 };
 
-// Simplified matcher: prefer city match; ignore pincode unless no city rule exists.
-const pickShippingRule = ({ city }, rules = []) => {
+// Matcher: only match on exact city name or a wildcard ('*') rule.
+// Returns null if the entered city is not covered by any active rule.
+const pickShippingRule = ({ city, pincode }, rules = []) => {
     const cityNormalized = normalizeCity(city);
     const activeRules = rules.filter((rule) => rule?.isActive !== false);
 
-    // 1) Exact city match (first active)
-    const cityRule = activeRules.find((rule) => normalizeCity(rule.cityNormalized || rule.city) === cityNormalized);
-    if (cityRule) return { rule: cityRule, ranges: parsePincodeRanges(cityRule.pincodeRanges), priority: 3 };
+    // Filter rules by city
+    const cityRules = activeRules.filter((rule) => normalizeCity(rule.cityNormalized || rule.city) === cityNormalized);
 
-    // 2) Wildcard rule
+    // 1) Exact city match + Pincode match
+    const exactPincodeRule = cityRules.find((rule) => isPincodeInRanges(pincode, rule.pincodeRanges));
+    if (exactPincodeRule) return { rule: exactPincodeRule, ranges: parsePincodeRanges(exactPincodeRule.pincodeRanges), priority: 4 };
+
+    // 2) Exact city match (general city-wide rule without pincode requirements)
+    // A rule with empty pincode ranges is considered city-wide
+    const cityWideRule = cityRules.find((rule) => {
+        const parsed = parsePincodeRanges(rule.pincodeRanges);
+        return parsed.length === 0;
+    });
+    if (cityWideRule) return { rule: cityWideRule, ranges: [], priority: 3 };
+
+    // 3) Wildcard rule — covers all cities (used in fresh DBs / open-delivery setups)
     const wildcardRule = activeRules.find((rule) => normalizeCity(rule.cityNormalized || rule.city) === '*');
     if (wildcardRule) return { rule: wildcardRule, ranges: parsePincodeRanges(wildcardRule.pincodeRanges), priority: 1 };
 
-    // 3) Any active rule fallback
-    if (activeRules.length > 0) {
-        const fallback = activeRules[0];
-        return { rule: fallback, ranges: parsePincodeRanges(fallback.pincodeRanges), priority: 0 };
-    }
+    // No match — delivery not available at this location
     return null;
 };
 
@@ -72,20 +80,20 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
     const matched = pickShippingRule({ city, pincode }, rules);
 
     if (!matched) {
-        // Always allow ordering even if no rule exists; default to free shipping.
+        // No active shipping rule covers this city — block the order.
         return {
             shippingCharge: 0,
             baseShippingCharge: 0,
             freeShippingThreshold: 0,
             orderValue,
             isChargeApplied: false,
-            matched: true,
-            serviceAvailable: true,
+            matched: false,
+            serviceAvailable: false,
             matchingMode: 'none',
             ruleId: null,
             city: normalizeCity(city),
             pincodeRangesText: '',
-            message: '',
+            message: 'Service is not available in this city',
         };
     }
 
@@ -101,7 +109,7 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
         isChargeApplied,
         matched: true,
         serviceAvailable: true,
-        matchingMode: matched.priority >= 2 ? 'city' : 'fallback',
+        matchingMode: matched.priority >= 4 ? 'pincode' : matched.priority >= 2 ? 'city' : 'fallback',
         ruleId: matched.rule._id || null,
         city: matched.rule.city,
         pincodeRangesText: formatPincodeRanges(matched.ranges),

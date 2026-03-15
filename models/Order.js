@@ -96,6 +96,28 @@ const orderSchema = new mongoose.Schema(
         refundReason: String,
         refundResponse: String,
         refundWindowDays: { type: Number, default: 5 },
+        // Item-level refund requests
+        refundRequests: [
+            {
+                itemId: { type: mongoose.Schema.Types.ObjectId },
+                productId: { type: mongoose.Schema.Types.ObjectId, ref: 'Product' },
+                vendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Vendor' },
+                title: String,
+                image: String,
+                qty: Number,
+                price: Number,
+                amount: Number,
+                status: {
+                    type: String,
+                    enum: ['requested', 'approved', 'rejected', 'processed'],
+                    default: 'requested',
+                },
+                reason: String,
+                responseNote: String,
+                requestedAt: { type: Date, default: Date.now },
+                processedAt: Date,
+            },
+        ],
         // Fulfillment per vendor
         vendorFulfillments: [
             {

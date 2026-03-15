@@ -381,45 +381,71 @@ router.put('/refund-settings', asyncHandler(async (req, res) => {
     res.json({ success: true, days: setting.value });
 }));
 
-// GET /api/admin/refunds — list refund requests
+// GET /api/admin/refunds — list item-level refund requests
 router.get('/refunds', asyncHandler(async (req, res) => {
-    const { status } = req.query;
-    const query = { refundStatus: { $ne: 'none' } };
-    if (status) query.refundStatus = status;
+    const { status } = req.query; // optional filter
 
-    const orders = await Order.find(query)
-        .populate('customerId', 'name email')
-        .populate('vendorIds', 'storeName')
-        .sort({ updatedAt: -1 })
-        .limit(200)
+    const orders = await Order.find({ 'refundRequests.0': { $exists: true } })
+        .populate('customerId', 'name email phone')
+        .populate('vendorIds', 'storeName address city state pincode phone')
+        .populate('refundRequests.vendorId', 'storeName address city state pincode phone')
         .lean();
 
-    res.json({ success: true, orders });
+    const refunds = [];
+    orders.forEach((order) => {
+        (order.refundRequests || []).forEach((reqItem) => {
+            if (status && reqItem.status !== status) return;
+            refunds.push({
+                _id: reqItem._id,
+                status: reqItem.status,
+                reason: reqItem.reason,
+                responseNote: reqItem.responseNote,
+                requestedAt: reqItem.requestedAt,
+                processedAt: reqItem.processedAt,
+                amount: reqItem.amount,
+                orderId: order._id,
+                orderNumber: order.orderNumber,
+                customer: order.customerId,
+                deliveryAddress: order.deliveryAddress,
+                product: {
+                    title: reqItem.title,
+                    image: reqItem.image,
+                    qty: reqItem.qty,
+                    price: reqItem.price,
+                },
+                vendor: reqItem.vendorId || order.vendorIds?.find((v) => v._id?.toString() === reqItem.vendorId?.toString()) || null,
+            });
+        });
+    });
+
+    refunds.sort((a, b) => new Date(b.requestedAt || 0) - new Date(a.requestedAt || 0));
+    res.json({ success: true, refunds });
 }));
 
-// PUT /api/admin/refunds/:id — update refund status
-router.put('/refunds/:id', asyncHandler(async (req, res) => {
+// PUT /api/admin/refunds/:refundId — update item-level refund status
+router.put('/refunds/:refundId', asyncHandler(async (req, res) => {
     const { status, responseNote } = req.body;
     const allowed = ['requested', 'approved', 'rejected', 'processed'];
     if (!allowed.includes(status)) {
         return res.status(400).json({ success: false, message: 'Invalid refund status' });
     }
 
-    const order = await Order.findById(req.params.id);
-    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    const order = await Order.findOne({ 'refundRequests._id': req.params.refundId });
+    if (!order) return res.status(404).json({ success: false, message: 'Refund request not found' });
 
-    order.refundStatus = status;
-    order.refundResponse = responseNote;
-    if (status === 'processed' || status === 'approved') {
-        order.paymentStatus = 'refunded';
-        order.refundProcessedAt = new Date();
-    }
-    if (status === 'rejected') {
-        order.paymentStatus = order.paymentStatus === 'refunded' ? 'paid' : order.paymentStatus;
+    const reqItem = order.refundRequests.id(req.params.refundId);
+    reqItem.status = status;
+    reqItem.responseNote = responseNote;
+    if (status === 'processed') reqItem.processedAt = new Date();
+
+    // Mark payment status as partial refund if any processed requests
+    if (status === 'processed') {
+        order.paymentStatus = 'partial_refund';
+        order.refundStatus = 'processed';
     }
 
     await order.save();
-    res.json({ success: true, order });
+    res.json({ success: true, refund: reqItem, orderId: order._id });
 }));
 
 // GET /api/admin/users

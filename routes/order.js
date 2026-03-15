@@ -14,18 +14,7 @@ const { calculateMultiVendorPayouts } = require('../utils/commission');
 const { normalizeCity, calculateShippingQuote } = require('../utils/shippingRules');
 const { getSettingValue } = require('../utils/settings');
 
-const ensureDefaultShippingRule = async () => {
-    const existing = await ShippingRule.findOne({ isActive: true });
-    if (existing) return;
-    await ShippingRule.create({
-        city: '*',
-        cityNormalized: '*',
-        pincodeRanges: [{ start: '000000', end: '999999' }],
-        shippingCharge: 0,
-        freeShippingThreshold: 0,
-        isActive: true,
-    });
-};
+// (Removed ensureDefaultShippingRule)
 
 // POST /api/orders — Create order
 router.post('/', optionalAuth, asyncHandler(async (req, res) => {
@@ -90,7 +79,6 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
     }
 
     const { platformTotal, vendorPayouts } = calculateMultiVendorPayouts(orderItems, commissionRates);
-    await ensureDefaultShippingRule();
 
     // Fetch all active rules and let matcher decide
     const ruleList = await ShippingRule.find({ isActive: true }).sort({ updatedAt: -1 }).lean();
@@ -101,6 +89,14 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         subtotal,
         discount,
     }, ruleList);
+
+    // Block order if delivery is not available at the customer's location
+    if (!shippingQuote.serviceAvailable) {
+        return res.status(422).json({
+            success: false,
+            message: shippingQuote.message || 'Delivery is not available at your location. Please use a supported city and pincode.',
+        });
+    }
 
     const total = Math.max(0, subtotal - discount + shippingQuote.shippingCharge);
     const refundWindowDays = await getSettingValue('refundWindowDays', 5);
@@ -143,6 +139,41 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         await Product.findByIdAndUpdate(item.productId, { $inc: { stock: -item.qty, orderCount: 1 } });
     }
 
+    // Save new address to user profile
+    let updatedUser = null;
+    if (req.user) {
+        try {
+            const user = await User.findById(req.user._id);
+            if (user) {
+                const addressExists = user.addresses.some(
+                    (addr) =>
+                        addr.line1.toLowerCase().trim() === deliveryAddress.line1.toLowerCase().trim() &&
+                        addr.city.toLowerCase().trim() === deliveryAddress.city.toLowerCase().trim() &&
+                        addr.pincode === deliveryAddress.pincode
+                );
+                
+                if (!addressExists) {
+                    const newAddress = {
+                        label: 'Saved Address',
+                        line1: deliveryAddress.line1,
+                        line2: deliveryAddress.line2 || '',
+                        city: deliveryAddress.city,
+                        state: deliveryAddress.state,
+                        pincode: deliveryAddress.pincode,
+                        lat: deliveryAddress.lat,
+                        lng: deliveryAddress.lng,
+                        isDefault: user.addresses.length === 0, // Make default if it's their first address
+                    };
+                    user.addresses.push(newAddress);
+                    updatedUser = await user.save();
+                }
+            }
+        } catch (err) {
+            console.error('Error auto-saving address to user profile:', err);
+            // Non-fatal error, do not block order success
+        }
+    }
+
     // Update coupon usage
     if (appliedCoupon) {
         appliedCoupon.usedCount += 1;
@@ -175,6 +206,7 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
             deliveryInfo: { ...deliveryInfo, deliveryCharge: shippingQuote.shippingCharge },
             shippingQuote,
         },
+        user: updatedUser
     });
 }));
 
@@ -198,10 +230,16 @@ router.get('/my', protect, asyncHandler(async (req, res) => {
 
 // GET /api/orders/:id — Order detail
 router.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
+    const isAdmin = req.user?.role === 'admin';
+    const vendorFields = isAdmin
+        ? 'storeName storeLogo phone email address city state pincode'
+        : 'storeName storeLogo phone';
+
     const order = await Order.findById(req.params.id)
         .populate('customerId', 'name email phone')
         .populate('items.productId', 'title images price')
-        .populate('vendorIds', 'storeName storeLogo phone')
+        .populate('vendorIds', vendorFields)
+        .populate('refundRequests.vendorId', 'storeName address city state pincode phone')
         .lean();
 
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
@@ -209,7 +247,6 @@ router.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
     // Auth check
     if (req.user) {
         const isOwner = order.customerId?._id?.toString() === req.user._id.toString();
-        const isAdmin = req.user.role === 'admin';
         const isVendor = req.user.role === 'vendor'; // TODO: check vendor ownership
         if (!isOwner && !isAdmin && !isVendor) {
             return res.status(403).json({ success: false, message: 'Not authorized' });
@@ -367,6 +404,52 @@ router.post('/:id/refund', protect, asyncHandler(async (req, res) => {
     });
 
     res.json({ success: true, message: 'Refund requested', order });
+}));
+
+// POST /api/orders/:id/refund-item — Customer requests refund for specific item
+router.post('/:id/refund-item', protect, asyncHandler(async (req, res) => {
+    const { reason, itemId } = req.body;
+    if (!itemId) return res.status(400).json({ success: false, message: 'itemId is required' });
+    const order = await Order.findOne({ _id: req.params.id, customerId: req.user._id });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (order.orderStatus !== 'delivered') return res.status(400).json({ success: false, message: 'Refunds available only after delivery' });
+    if (!order.deliveredAt) return res.status(400).json({ success: false, message: 'Delivered timestamp missing, contact support' });
+
+    const refundWindowDays = order.refundWindowDays || await getSettingValue('refundWindowDays', 5);
+    const lastRefundDate = new Date(order.deliveredAt.getTime() + Number(refundWindowDays || 0) * 24 * 60 * 60 * 1000);
+    if (new Date() > lastRefundDate) return res.status(400).json({ success: false, message: 'Refund window has expired' });
+
+    const targetItem = order.items.id(itemId) || order.items.find((i) => i._id?.toString() === itemId);
+    if (!targetItem) return res.status(404).json({ success: false, message: 'Item not found in order' });
+
+    const existing = order.refundRequests.find((r) => r.itemId?.toString() === targetItem._id.toString() && r.status !== 'rejected' && r.status !== 'processed');
+    if (existing) return res.status(400).json({ success: false, message: 'Refund already requested for this item' });
+
+    order.refundRequests.push({
+        itemId: targetItem._id,
+        productId: targetItem.productId,
+        vendorId: targetItem.vendorId,
+        title: targetItem.title,
+        image: targetItem.image,
+        qty: targetItem.qty,
+        price: targetItem.price,
+        amount: targetItem.price * targetItem.qty,
+        status: 'requested',
+        reason,
+        requestedAt: new Date(),
+    });
+
+    await order.save();
+
+    const { notifyAdmin } = require('../utils/adminNotificationEngine');
+    await notifyAdmin(req.app.get('io'), {
+        type: 'refund_requested',
+        message: `Refund Requested: #${order.orderNumber} (item)`,
+        link: `/admin/refunds`,
+        relatedId: order._id,
+    });
+
+    res.json({ success: true, message: 'Refund requested for item', order });
 }));
 
 // GET /api/orders/:id/track — Real-time tracking info
