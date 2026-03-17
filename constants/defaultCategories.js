@@ -1,4 +1,5 @@
 const DEFAULT_CATEGORIES = [
+    { name: 'All', slug: 'all', icon: '✨', themeColor: '#f97316', sortOrder: 0 },
     { name: 'Electronics', slug: 'electronics', icon: '📱', themeColor: '#3b82f6', sortOrder: 1 },
     { name: 'Furniture and Home', slug: 'furniture-and-home', icon: '🛋️', themeColor: '#0ea5e9', sortOrder: 2 },
     { name: 'Fashion', slug: 'fashion', icon: '👗', themeColor: '#ec4899', sortOrder: 3 },

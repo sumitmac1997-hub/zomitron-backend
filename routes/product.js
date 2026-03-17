@@ -50,6 +50,18 @@ const coerceBoolean = (val) => {
     return ['true', '1', 'yes', 'on'].includes(String(val).toLowerCase());
 };
 
+// Map a category ObjectId to its name (simple cache to avoid repeated queries)
+const categoryNameCache = new Map();
+const resolveCategoryName = async (categoryId) => {
+    if (!categoryId) return undefined;
+    const key = String(categoryId);
+    if (categoryNameCache.has(key)) return categoryNameCache.get(key);
+    const doc = await Category.findById(categoryId).select('name').lean();
+    const name = doc?.name;
+    if (name) categoryNameCache.set(key, name);
+    return name;
+};
+
 const parseStringList = (val, splitPattern = /[,|]/) => {
     if (val === null || val === undefined) return [];
     if (Array.isArray(val)) {
@@ -681,6 +693,13 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         });
     }
 
+    // Resolve categoryName for primary category (first in list or single)
+    const primaryCategoryId = categoryList[0] || category;
+    const primaryCategoryName = await resolveCategoryName(primaryCategoryId);
+    if (primaryCategoryName) {
+        payloads.forEach((p) => { p.categoryName = primaryCategoryName; });
+    }
+
     const createdProducts = await Product.create(payloads);
     const createdList = Array.isArray(createdProducts) ? createdProducts : [createdProducts];
 
@@ -745,7 +764,15 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
                 .map((c) => c.trim())
                 .filter(Boolean);
         updates.categories = categoryList;
-        if (categoryList.length > 0) updates.category = categoryList[0];
+        if (categoryList.length > 0) {
+            updates.category = categoryList[0];
+            const primaryName = await resolveCategoryName(categoryList[0]);
+            if (primaryName) updates.categoryName = primaryName;
+        }
+    }
+    if (updates.category && !updates.categoryName) {
+        const primaryName = await resolveCategoryName(updates.category);
+        if (primaryName) updates.categoryName = primaryName;
     }
     const variationUploads = req.files?.variationImages || [];
     let targetVendor = null;
