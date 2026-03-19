@@ -11,18 +11,22 @@ const { syncDefaultCategories } = require('../utils/syncDefaultCategories');
 router.get('/', asyncHandler(async (req, res) => {
     await syncDefaultCategories();
 
-    const categories = await Category.find({ isActive: true, parent: null })
-        .sort({ sortOrder: 1, name: 1 })
-        .lean();
+    const all = await Category.find({ isActive: true }).sort({ sortOrder: 1, name: 1 }).lean();
 
-    // Attach subcategories
-    const subs = await Category.find({ isActive: true, parent: { $ne: null } }).sort({ sortOrder: 1 }).lean();
-    const categoriesWithSubs = categories.map((cat) => ({
-        ...cat,
-        subcategories: subs.filter((s) => s.parent?.toString() === cat._id.toString()),
-    }));
+    const byId = new Map();
+    all.forEach((cat) => byId.set(String(cat._id), { ...cat, subcategories: [] }));
 
-    res.json({ success: true, categories: categoriesWithSubs });
+    const roots = [];
+    byId.forEach((cat) => {
+        if (cat.parent) {
+            const parent = byId.get(String(cat.parent));
+            if (parent) parent.subcategories.push(cat);
+        } else {
+            roots.push(cat);
+        }
+    });
+
+    res.json({ success: true, categories: roots });
 }));
 
 // GET /api/categories/flat — All categories flat list

@@ -214,28 +214,42 @@ router.get('/orders/:id/invoice', asyncHandler(async (req, res) => {
 
 // GET /api/admin/products — All products (moderation)
 router.get('/products', asyncHandler(async (req, res) => {
-    const { page = 1, limit = 20, isApproved, vendorId } = req.query;
-    const query = {};
-    if (isApproved !== undefined) query.isApproved = isApproved === 'true';
-    if (vendorId) query.vendorId = vendorId;
+    const { page = 1, limit = 20, isApproved, vendorId, search } = req.query;
+    const filters = [];
+
+    if (isApproved !== undefined) filters.push({ isApproved: isApproved === 'true' });
+    if (vendorId) filters.push({ vendorId });
+
+    const searchTerm = String(search || '').trim();
+    let projection;
+    let sort = { createdAt: -1 };
+
+    if (searchTerm) {
+        filters.push({ $text: { $search: searchTerm } });
+        projection = { score: { $meta: 'textScore' } };
+        sort = { score: { $meta: 'textScore' }, createdAt: -1 };
+    }
+
+    const query = filters.length ? { $and: filters } : {};
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
 
     const total = await Product.countDocuments(query);
-    const products = await Product.find(query)
+    const products = await Product.find(query, projection)
         .populate('vendorId', 'storeName')
-        .sort({ createdAt: -1 })
-        .skip((parseInt(page) - 1) * parseInt(limit))
-        .limit(parseInt(limit))
+        .sort(sort)
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
         .lean();
 
     res.json({
         success: true,
         products,
         total,
-        page: parseInt(page),
-        pages: Math.ceil(total / parseInt(limit)),
+        page: pageNum,
+        pages: Math.ceil(total / limitNum),
     });
 }));
-
 // PUT /api/admin/products/:id/approve
 router.put('/products/:id/approve', asyncHandler(async (req, res) => {
     const { isApproved } = req.body;
@@ -301,10 +315,15 @@ router.post('/shipping-rules', asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: 'Free shipping threshold must be 0 or more' });
     }
 
+    const parsedRanges = parsePincodeRanges(pincodeRangesText || pincodeRanges);
+    if (String(pincodeRangesText || pincodeRanges || '').trim() && parsedRanges.length === 0) {
+        return res.status(400).json({ success: false, message: 'No valid pincodes found in the range. Use 6-digit pins or ranges like 560001-560010.' });
+    }
+
     const rule = await ShippingRule.create({
         city: String(city).trim(),
         cityNormalized: normalizeCity(city),
-        pincodeRanges: parsePincodeRanges(pincodeRangesText || pincodeRanges),
+        pincodeRanges: parsedRanges,
         freeShippingThreshold: Number(freeShippingThreshold) || 0,
         shippingCharge: Number(shippingCharge) || 0,
         isActive: isActive !== false && isActive !== 'false',
@@ -341,12 +360,17 @@ router.put('/shipping-rules/:id', asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: 'Free shipping threshold must be 0 or more' });
     }
 
+    const parsedRanges = parsePincodeRanges(pincodeRangesText || pincodeRanges);
+    if (String(pincodeRangesText || pincodeRanges || '').trim() && parsedRanges.length === 0) {
+        return res.status(400).json({ success: false, message: 'No valid pincodes found in the range. Use 6-digit pins or ranges like 560001-560010.' });
+    }
+
     const rule = await ShippingRule.findByIdAndUpdate(
         req.params.id,
         {
             city: String(city).trim(),
             cityNormalized: normalizeCity(city),
-            pincodeRanges: parsePincodeRanges(pincodeRangesText || pincodeRanges),
+            pincodeRanges: parsedRanges,
             freeShippingThreshold: Number(freeShippingThreshold) || 0,
             shippingCharge: Number(shippingCharge) || 0,
             isActive: isActive !== false && isActive !== 'false',

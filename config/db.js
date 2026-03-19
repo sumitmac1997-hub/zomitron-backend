@@ -82,6 +82,13 @@ const connectDB = async () => {
         };
 
         await safeCreateIndex('products', { location: '2dsphere' });
+        await safeCreateIndex('products', {
+            title: 'text',
+            description: 'text',
+            tags: 'text',
+            categoryName: 'text',
+            sku: 'text',
+        }, { name: 'product_text_search' });
         await safeCreateIndex('vendors', { location: '2dsphere' });
         await safeCreateIndex('pincodes', { pincode: 1 }, { unique: true });
         console.log('📍 Geospatial indexes ensured');
