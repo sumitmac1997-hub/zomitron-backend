@@ -5,6 +5,7 @@ const Product = require('../models/Product');
 const Vendor = require('../models/Vendor');
 const Category = require('../models/Category');
 const TaxClass = require('../models/TaxClass');
+const User = require('../models/User');
 const { protect, authorize } = require('../middleware/auth');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo } = require('../utils/deliveryETA');
@@ -962,16 +963,24 @@ router.post('/bulk-upload', protect, authorize('vendor', 'admin'), uploadCSV.sin
 
 // POST /api/products/:id/wishlist — toggle wishlist
 router.post('/:id/wishlist', protect, asyncHandler(async (req, res) => {
-    const user = req.user;
     const productId = req.params.id;
-    const inWishlist = user.wishlist?.includes(productId);
+    const user = await User.findById(req.user._id).select('wishlist');
+    if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+
+    const wishlistIds = (user.wishlist || []).map((id) => String(id));
+    const inWishlist = wishlistIds.includes(String(productId));
 
     const update = inWishlist
         ? { $pull: { wishlist: productId } }
         : { $addToSet: { wishlist: productId } };
 
-    await require('../models/User').findByIdAndUpdate(user._id, update);
-    res.json({ success: true, inWishlist: !inWishlist, message: inWishlist ? 'Removed from wishlist' : 'Added to wishlist' });
+    const updatedUser = await User.findByIdAndUpdate(req.user._id, update, { new: true }).select('wishlist');
+    res.json({
+        success: true,
+        inWishlist: !inWishlist,
+        wishlist: (updatedUser?.wishlist || []).map((id) => String(id)),
+        message: inWishlist ? 'Removed from wishlist' : 'Added to wishlist',
+    });
 }));
 
 module.exports = router;

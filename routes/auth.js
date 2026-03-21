@@ -8,24 +8,71 @@ const Vendor = require('../models/Vendor');
 const { generateTokens } = require('../middleware/auth');
 const nodemailer = require('nodemailer');
 
-// Email transporter
-const transporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: process.env.SMTP_PORT,
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
-});
+const emailUser = process.env.SMTP_USER || process.env.SMTP_USERNAME || process.env.EMAIL_USER;
+const emailPass = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || process.env.EMAIL_PASS;
+const emailHost = process.env.SMTP_HOST || process.env.EMAIL_HOST;
+const emailPort = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT) || 587;
+const emailService = process.env.SMTP_SERVICE || process.env.EMAIL_SERVICE;
+const emailFrom = process.env.EMAIL_FROM || process.env.SMTP_FROM || emailUser;
+const emailSecure = process.env.SMTP_SECURE
+    ? ['true', '1', 'yes'].includes(String(process.env.SMTP_SECURE).toLowerCase())
+    : emailPort === 465;
+
+const createTransporter = () => {
+    if (process.env.NODE_ENV === 'test') {
+        return nodemailer.createTransport({ jsonTransport: true });
+    }
+
+    if (!emailUser || !emailPass) {
+        return null;
+    }
+
+    if (emailService) {
+        return nodemailer.createTransport({
+            service: emailService,
+            auth: { user: emailUser, pass: emailPass },
+        });
+    }
+
+    if (emailHost) {
+        return nodemailer.createTransport({
+            host: emailHost,
+            port: emailPort,
+            secure: emailSecure,
+            auth: { user: emailUser, pass: emailPass },
+        });
+    }
+
+    return null;
+};
+
+const transporter = createTransporter();
+
+const assertEmailConfig = () => {
+    if (process.env.NODE_ENV === 'test') return;
+
+    if (!emailUser || !emailPass) {
+        throw new Error('Email credentials are missing. Set SMTP_USER/SMTP_PASS or EMAIL_USER/EMAIL_PASS.');
+    }
+
+    if (!emailHost && !emailService) {
+        throw new Error('Email server is missing. Set SMTP_HOST or SMTP_SERVICE in backend .env.');
+    }
+};
 
 const sendEmail = async (to, subject, html) => {
-    try {
-        await transporter.sendMail({
-            from: process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER,
-            to,
-            subject,
-            html,
-        });
-    } catch (err) {
-        console.error('Email send failed:', err.message);
+    assertEmailConfig();
+
+    if (!transporter) {
+        throw new Error('Email transport is not configured.');
     }
+
+    await transporter.sendMail({
+        from: emailFrom,
+        to,
+        subject,
+        html,
+    });
 };
 
 // POST /api/auth/register
@@ -43,16 +90,25 @@ router.post('/register', asyncHandler(async (req, res) => {
     if (existing) return res.status(400).json({ success: false, message: 'Email already registered' });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const user = await User.create({
-        name, email: email.toLowerCase(), password, phone, role,
-        otp, otpExpiry: new Date(Date.now() + 10 * 60 * 1000), // 10 min
-    });
+    let user;
 
-    await sendEmail(email, 'Verify your Zomitron account', `
+    try {
+        user = await User.create({
+            name, email: email.toLowerCase(), password, phone, role,
+            otp, otpExpiry: new Date(Date.now() + 10 * 60 * 1000), // 10 min
+        });
+
+        await sendEmail(email, 'Verify your Zomitron account', `
     <h2>Welcome to Zomitron!</h2>
     <p>Your OTP is: <strong>${otp}</strong></p>
     <p>This OTP expires in 10 minutes.</p>
   `);
+    } catch (err) {
+        if (user?._id) {
+            await User.findByIdAndDelete(user._id);
+        }
+        throw err;
+    }
 
     const { accessToken, refreshToken } = generateTokens(user._id);
     await User.findByIdAndUpdate(user._id, { refreshToken });
@@ -172,7 +228,8 @@ router.post('/forgot-password', asyncHandler(async (req, res) => {
     user.otpExpiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
     await user.save({ validateBeforeSave: false });
 
-    const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}&email=${email}`;
+    const clientUrl = (process.env.CLIENT_URL || 'http://localhost:5173').replace(/\/+$/, '');
+    const resetUrl = `${clientUrl}/reset-password?token=${encodeURIComponent(resetToken)}&email=${encodeURIComponent(user.email)}`;
     await sendEmail(email, 'Reset your Zomitron password', `
     <h2>Password Reset Request</h2>
     <p>Click below to reset your password (valid 1 hour):</p>
@@ -184,6 +241,10 @@ router.post('/forgot-password', asyncHandler(async (req, res) => {
 // POST /api/auth/reset-password
 router.post('/reset-password', asyncHandler(async (req, res) => {
     const { email, token, password } = req.body;
+    if (!password || String(password).length < 6) {
+        return res.status(400).json({ success: false, message: 'Password must be at least 6 characters' });
+    }
+
     const user = await User.findOne({ email: email?.toLowerCase() });
     if (!user || user.otp !== token || new Date() > user.otpExpiry) {
         return res.status(400).json({ success: false, message: 'Invalid or expired reset token' });
