@@ -19,7 +19,6 @@ const pincodeSchema = new mongoose.Schema(
     { timestamps: false }
 );
 
-pincodeSchema.index({ pincode: 1 }, { unique: true });
 pincodeSchema.index({ location: '2dsphere' });
 pincodeSchema.index({ city: 1 });
 pincodeSchema.index({ state: 1 });

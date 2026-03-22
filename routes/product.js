@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const asyncHandler = require('express-async-handler');
+const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Vendor = require('../models/Vendor');
 const Category = require('../models/Category');
@@ -9,15 +10,45 @@ const User = require('../models/User');
 const { protect, authorize } = require('../middleware/auth');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo } = require('../utils/deliveryETA');
+const { buildCacheKey, clearCacheByPrefix, getCacheEntry, setCacheEntry } = require('../utils/cache');
 const { uploadProduct, uploadCSV, toUploadUrl } = require('../config/cloudinary');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
+
+const PRODUCT_CACHE_PREFIX = 'products';
+const PRODUCT_LIST_CACHE_PREFIX = `${PRODUCT_CACHE_PREFIX}:list`;
+const PRODUCT_LIST_CACHE_TTL_SECONDS = Number(process.env.PRODUCTS_CACHE_TTL_SECONDS) || 15;
+const MAX_PUBLIC_PRODUCTS_LIMIT = Number(process.env.MAX_PUBLIC_PRODUCTS_LIMIT) || 40;
+const EARTH_RADIUS_KM = 6371;
+const PRODUCT_LIST_SELECT = [
+    '_id',
+    'title',
+    'slug',
+    'images',
+    'price',
+    'discountPrice',
+    'stock',
+    'city',
+    'state',
+    'pincode',
+    'ratings',
+    'isFeatured',
+    'vendorId',
+    'category',
+    'categoryName',
+    'location',
+    'createdAt',
+    'orderCount',
+].join(' ');
+const PRODUCT_LIST_VENDOR_SELECT = '_id storeName storeLogo ratings address isOpen approved';
+const PRODUCT_LIST_CATEGORY_SELECT = '_id name slug icon';
 
 const clean = (val) => (val ?? '').toString().trim();
 const normalizeNumber = (val) => {
     const cleaned = clean(val).replace(/[^0-9.\-]/g, '');
     return cleaned ? parseFloat(cleaned) : NaN;
 };
+const isAllCategorySlug = (value) => clean(value).toLowerCase() === 'all';
 
 // Build/find category from a free-text name (first value of CSV categories)
 const categoryCache = new Map();
@@ -57,7 +88,13 @@ const resolveCategoryName = async (categoryId) => {
     if (!categoryId) return undefined;
     const key = String(categoryId);
     if (categoryNameCache.has(key)) return categoryNameCache.get(key);
-    const doc = await Category.findById(categoryId).select('name').lean();
+    const query = typeof Category.findById === 'function'
+        ? Category.findById(categoryId)
+        : (typeof Category.findOne === 'function' ? Category.findOne({ _id: categoryId }) : null);
+    if (!query) return undefined;
+
+    const selected = typeof query.select === 'function' ? query.select('name') : query;
+    const doc = typeof selected?.lean === 'function' ? await selected.lean() : await selected;
     const name = doc?.name;
     if (name) categoryNameCache.set(key, name);
     return name;
@@ -79,16 +116,216 @@ const parseStringList = (val, splitPattern = /[,|]/) => {
 
 const parseIdList = (val) => [...new Set(parseStringList(val, /,/))];
 
+const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const parsePositiveInt = (value, fallback, max = Number.MAX_SAFE_INTEGER) => {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+    return Math.min(parsed, max);
+};
+const parseObjectId = (value) => (mongoose.Types.ObjectId.isValid(value)
+    ? mongoose.Types.ObjectId.createFromHexString(String(value))
+    : null);
+const normalizeCacheQuery = (query) => Object.entries(query)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .reduce((acc, [key, value]) => {
+        acc[key] = Array.isArray(value) ? value.join(',') : value;
+        return acc;
+    }, {});
+const getProductSort = (sort, hasLocation) => {
+    switch (sort) {
+        case 'price_asc': return { price: 1, _id: 1 };
+        case 'price_desc': return { price: -1, _id: 1 };
+        case 'newest': return { createdAt: -1, _id: -1 };
+        case 'rating': return { 'ratings.average': -1, 'ratings.count': -1, _id: -1 };
+        case 'popular': return { orderCount: -1, _id: -1 };
+        default: return hasLocation ? null : { createdAt: -1, _id: -1 };
+    }
+};
+const invalidateProductCache = () => clearCacheByPrefix(PRODUCT_CACHE_PREFIX);
+
+const loadCategoryFilterIds = async (category) => {
+    const normalizedCategory = clean(category);
+    if (!normalizedCategory || isAllCategorySlug(normalizedCategory)) return [];
+
+    if (mongoose.Types.ObjectId.isValid(normalizedCategory)) {
+        const categoryId = mongoose.Types.ObjectId.createFromHexString(String(normalizedCategory));
+        const children = await Category.find({ parent: categoryId }).select('_id').lean();
+        return [categoryId, ...children.map((child) => child._id)];
+    }
+
+    const currentCategory = await Category.findOne({ slug: normalizedCategory.toLowerCase() }).select('_id').lean();
+    if (!currentCategory) return [];
+
+    const children = await Category.find({ parent: currentCategory._id }).select('_id').lean();
+    return [currentCategory._id, ...children.map((child) => child._id)];
+};
+
+const buildPublicProductsFilter = async (query) => {
+    const {
+        category,
+        subCategory,
+        minPrice,
+        maxPrice,
+        search,
+        pincode,
+        vendorId,
+        featured,
+        minRating,
+    } = query;
+
+    const filter = {
+        isActive: true,
+        isApproved: true,
+        stock: { $gt: 0 },
+    };
+
+    if (category && !isAllCategorySlug(category)) {
+        const categoryIds = await loadCategoryFilterIds(category);
+        if (categoryIds.length > 0) {
+            filter.$or = [
+                { category: { $in: categoryIds } },
+                { categories: { $in: categoryIds } },
+            ];
+        }
+    }
+
+    if (subCategory) {
+        const subCategoryId = parseObjectId(subCategory);
+        if (subCategoryId) filter.subCategory = subCategoryId;
+    }
+
+    if (vendorId) {
+        const vendorObjectId = parseObjectId(vendorId);
+        if (vendorObjectId) filter.vendorId = vendorObjectId;
+    }
+
+    if (pincode) filter.pincode = clean(pincode);
+    if (featured === 'true') filter.isFeatured = true;
+
+    if (minPrice || maxPrice) {
+        filter.price = {};
+        if (minPrice) filter.price.$gte = parseFloat(minPrice);
+        if (maxPrice) filter.price.$lte = parseFloat(maxPrice);
+    }
+
+    if (minRating) filter['ratings.average'] = { $gte: parseFloat(minRating) };
+
+    if (search) {
+        const searchTerm = clean(search).slice(0, 80);
+        if (searchTerm) {
+            const safeRegex = new RegExp(escapeRegex(searchTerm), 'i');
+            filter.$and = [
+                ...(filter.$and || []),
+                {
+                    $or: [
+                        { title: safeRegex },
+                        { description: safeRegex },
+                        { tags: { $in: [safeRegex] } },
+                        { categoryName: safeRegex },
+                    ],
+                },
+            ];
+        }
+    }
+
+    return filter;
+};
+
+const buildProductsListResponse = async ({
+    products,
+    total,
+    pageNum,
+    limitNum,
+    radiusNum,
+    customerLat,
+    customerLng,
+}) => {
+    const vendorIds = [...new Set(products.map((product) => String(product.vendorId || '')).filter(Boolean))];
+    const categoryIds = [...new Set(products.map((product) => String(product.category || '')).filter(Boolean))];
+
+    const [vendors, categories] = await Promise.all([
+        vendorIds.length > 0
+            ? Vendor.find({ _id: { $in: vendorIds } }).select(PRODUCT_LIST_VENDOR_SELECT).lean()
+            : Promise.resolve([]),
+        categoryIds.length > 0
+            ? Category.find({ _id: { $in: categoryIds } }).select(PRODUCT_LIST_CATEGORY_SELECT).lean()
+            : Promise.resolve([]),
+    ]);
+
+    const vendorMap = new Map(
+        vendors
+            .filter((vendor) => vendor.approved !== false && vendor.isOpen !== false)
+            .map((vendor) => [String(vendor._id), vendor]),
+    );
+    const categoryMap = new Map(categories.map((category) => [String(category._id), category]));
+
+    const shapedProducts = products
+        .map((product) => {
+            const vendor = vendorMap.get(String(product.vendorId || ''));
+            if (!vendor) return null;
+
+            const coordinates = product.location?.coordinates || [];
+            const distanceKm = Number.isFinite(customerLat) && Number.isFinite(customerLng) && coordinates.length === 2
+                ? haversineDistance(customerLat, customerLng, coordinates[1], coordinates[0])
+                : undefined;
+
+            return {
+                _id: product._id,
+                title: product.title,
+                slug: product.slug,
+                images: Array.isArray(product.images) ? product.images.slice(0, 1) : [],
+                price: product.price,
+                discountPrice: product.discountPrice,
+                effectivePrice: product.discountPrice || product.price,
+                discountPercent: product.discountPrice
+                    ? Math.round(((product.price - product.discountPrice) / product.price) * 100)
+                    : 0,
+                stock: product.stock,
+                city: product.city,
+                state: product.state,
+                pincode: product.pincode,
+                ratings: product.ratings,
+                isFeatured: product.isFeatured,
+                vendorId: product.vendorId,
+                vendor,
+                category: product.category,
+                categoryName: product.categoryName,
+                categoryInfo: categoryMap.get(String(product.category || '')) || null,
+                distanceKm,
+                deliveryInfo: Number.isFinite(distanceKm) ? getDeliveryInfo(distanceKm) : null,
+                createdAt: product.createdAt,
+                orderCount: product.orderCount,
+            };
+        })
+        .filter(Boolean);
+
+    return {
+        success: true,
+        count: shapedProducts.length,
+        total,
+        page: pageNum,
+        pages: Math.ceil(total / limitNum),
+        products: shapedProducts,
+        meta: {
+            radius: radiusNum,
+            location: Number.isFinite(customerLat) && Number.isFinite(customerLng)
+                ? { lat: customerLat, lng: customerLng }
+                : null,
+        },
+    };
+};
+
 const buildCatalogSearch = (search) => {
     const term = clean(search);
     if (!term) return null;
+    const safeRegex = new RegExp(escapeRegex(term), 'i');
     return {
         $or: [
-            { title: { $regex: term, $options: 'i' } },
-            { description: { $regex: term, $options: 'i' } },
-            { sku: { $regex: term, $options: 'i' } },
-            { categoryName: { $regex: term, $options: 'i' } },
-            { tags: { $in: [new RegExp(term, 'i')] } },
+            { title: safeRegex },
+            { description: safeRegex },
+            { sku: safeRegex },
+            { categoryName: safeRegex },
+            { tags: { $in: [safeRegex] } },
         ],
     };
 };
@@ -161,177 +398,96 @@ router.get('/', asyncHandler(async (req, res) => {
         featured, minRating,
     } = req.query;
 
-    const pageNum = parseInt(page);
-    const limitNum = Math.min(parseInt(limit), 100);
+    const pageNum = parsePositiveInt(page, 1);
+    const limitNum = parsePositiveInt(limit, 20, MAX_PUBLIC_PRODUCTS_LIMIT);
     const skip = (pageNum - 1) * limitNum;
-    const radiusNum = Math.min(parseInt(radius), 500); // Max 500km
-
-    let pipeline = [];
-
-    // ─── GEOSPATIAL FILTER (Primary method: $geoNear) ─────────────────────
-    if (lat && lng) {
-        const customerLat = parseFloat(lat);
-        const customerLng = parseFloat(lng);
-
-        pipeline.push({
-            $geoNear: {
-                near: { type: 'Point', coordinates: [customerLng, customerLat] },
-                distanceField: 'distance', // distance in meters
-                maxDistance: radiusNum * 1000, // convert km to meters
-                spherical: true,
-                query: { isActive: true, isApproved: true, stock: { $gt: 0 } },
-            },
-        });
-
-        // Convert distance to km
-        pipeline.push({
-            $addFields: { distanceKm: { $divide: ['$distance', 1000] } },
-        });
-    } else {
-        // No location — show all active products
-        pipeline.push({ $match: { isActive: true, isApproved: true, stock: { $gt: 0 } } });
-    }
-
-    // ─── FILTERS ──────────────────────────────────────────────────────────
-    const matchStage = {};
-
-    if (category) {
-        // Allow category name or ID; include subcategories for parent filters
-        const categoryIds = [];
-        if (category.match(/^[0-9a-fA-F]{24}$/)) {
-            const categoryId = require('mongoose').Types.ObjectId.createFromHexString(category);
-            categoryIds.push(categoryId);
-            const children = await Category.find({ parent: categoryId }).select('_id').lean();
-            categoryIds.push(...children.map((c) => c._id));
-        } else {
-            // Look up by slug
-            const cat = await Category.findOne({ slug: category.toLowerCase() });
-            if (cat) {
-                categoryIds.push(cat._id);
-                const children = await Category.find({ parent: cat._id }).select('_id').lean();
-                categoryIds.push(...children.map((c) => c._id));
-            }
-        }
-        if (categoryIds.length > 0) {
-            matchStage.$or = [
-                { category: { $in: categoryIds } },
-                { categories: { $in: categoryIds } },
-            ];
-        }
-    }
-    if (subCategory) matchStage.subCategory = require('mongoose').Types.ObjectId.createFromHexString(subCategory);
-    if (vendorId) matchStage.vendorId = require('mongoose').Types.ObjectId.createFromHexString(vendorId);
-    if (pincode) matchStage.pincode = pincode;
-    if (featured === 'true') matchStage.isFeatured = true;
-    if (minPrice || maxPrice) {
-        matchStage.price = {};
-        if (minPrice) matchStage.price.$gte = parseFloat(minPrice);
-        if (maxPrice) matchStage.price.$lte = parseFloat(maxPrice);
-    }
-    if (minRating) matchStage['ratings.average'] = { $gte: parseFloat(minRating) };
-
-    if (Object.keys(matchStage).length > 0) pipeline.push({ $match: matchStage });
-
-    // ─── TEXT SEARCH ──────────────────────────────────────────────────────
-    if (search) {
-        pipeline.push({
-            $match: {
-                $or: [
-                    { title: { $regex: search, $options: 'i' } },
-                    { description: { $regex: search, $options: 'i' } },
-                    { tags: { $in: [new RegExp(search, 'i')] } },
-                    { categoryName: { $regex: search, $options: 'i' } },
-                ],
-            },
-        });
-    }
-
-    // ─── SORT ─────────────────────────────────────────────────────────────
-    let sortStage = {};
-    switch (sort) {
-        case 'price_asc': sortStage = { price: 1 }; break;
-        case 'price_desc': sortStage = { price: -1 }; break;
-        case 'newest': sortStage = { createdAt: -1 }; break;
-        case 'rating': sortStage = { 'ratings.average': -1, 'ratings.count': -1 }; break;
-        case 'popular': sortStage = { orderCount: -1 }; break;
-        default: sortStage = lat && lng ? { distanceKm: 1 } : { createdAt: -1 }; // nearest first if location known
-    }
-    pipeline.push({ $sort: sortStage });
-
-    // ─── PAGINATION (facet for count + data in one query) ─────────────────
-    pipeline.push({
-        $facet: {
-            metadata: [{ $count: 'total' }],
-            data: [
-                { $skip: skip },
-                { $limit: limitNum },
-                // Populate vendor
-                {
-                    $lookup: {
-                        from: 'vendors',
-                        localField: 'vendorId',
-                        foreignField: '_id',
-                        as: 'vendor',
-                        pipeline: [{ $project: { storeName: 1, storeLogo: 1, ratings: 1, address: 1, isOpen: 1, approved: 1 } }],
-                    },
-                },
-                { $unwind: { path: '$vendor', preserveNullAndEmptyArrays: true } },
-                { $match: { 'vendor.isOpen': { $ne: false }, 'vendor.approved': { $ne: false } } },
-                // Populate category
-                {
-                    $lookup: {
-                        from: 'categories',
-                        localField: 'category',
-                        foreignField: '_id',
-                        as: 'categoryInfo',
-                        pipeline: [{ $project: { name: 1, slug: 1, icon: 1 } }],
-                    },
-                },
-                { $unwind: { path: '$categoryInfo', preserveNullAndEmptyArrays: true } },
-                // Add delivery info
-                {
-                    $addFields: {
-                        deliveryInfo: {
-                            $cond: {
-                                if: { $ifNull: ['$distanceKm', false] },
-                                then: '$distanceKm', // Will be processed in JS below
-                                else: null,
-                            },
-                        },
-                    },
-                },
-            ],
-        },
-    });
-
-    const [result] = await Product.aggregate(pipeline);
-    const total = result.metadata[0]?.total || 0;
-
-    // Add delivery info to each product (post-aggregation)
-    const products = result.data.map((p) => ({
-        ...p,
-        deliveryInfo: p.distanceKm !== undefined ? getDeliveryInfo(p.distanceKm) : null,
-        discountPercent: p.discountPrice ? Math.round(((p.price - p.discountPrice) / p.price) * 100) : 0,
-        effectivePrice: p.discountPrice || p.price,
+    const radiusNum = Math.min(parsePositiveInt(radius, 100, 500), 500);
+    const customerLat = Number.parseFloat(lat);
+    const customerLng = Number.parseFloat(lng);
+    const hasLocation = Number.isFinite(customerLat) && Number.isFinite(customerLng);
+    const cacheKey = buildCacheKey(PRODUCT_LIST_CACHE_PREFIX, normalizeCacheQuery({
+        lat,
+        lng,
+        radius: radiusNum,
+        category,
+        subCategory,
+        minPrice,
+        maxPrice,
+        sort,
+        page: pageNum,
+        limit: limitNum,
+        search,
+        pincode,
+        vendorId,
+        featured,
+        minRating,
     }));
 
-    res.json({
-        success: true,
-        count: products.length,
-        total,
-        page: pageNum,
-        pages: Math.ceil(total / limitNum),
+    const cachedResponse = getCacheEntry(cacheKey);
+    if (cachedResponse) {
+        res.set('X-Cache', 'HIT');
+        return res.json(cachedResponse);
+    }
+
+    const baseFilter = await buildPublicProductsFilter(req.query);
+    const countFilter = { ...baseFilter };
+    const listFilter = { ...baseFilter };
+
+    if (hasLocation) {
+        const center = [customerLng, customerLat];
+        const geoWithin = {
+            $geoWithin: {
+                $centerSphere: [center, radiusNum / EARTH_RADIUS_KM],
+            },
+        };
+
+        countFilter.location = geoWithin;
+
+        if (sort === 'nearest') {
+            listFilter.location = {
+                $nearSphere: {
+                    $geometry: { type: 'Point', coordinates: center },
+                    $maxDistance: radiusNum * 1000,
+                },
+            };
+        } else {
+            listFilter.location = geoWithin;
+        }
+    }
+
+    const sortStage = getProductSort(sort, hasLocation);
+    const listQuery = Product.find(listFilter)
+        .select(PRODUCT_LIST_SELECT)
+        .skip(skip)
+        .limit(limitNum)
+        .lean();
+
+    if (sortStage) listQuery.sort(sortStage);
+
+    const [products, total] = await Promise.all([
+        listQuery,
+        Product.countDocuments(countFilter),
+    ]);
+
+    const responseBody = await buildProductsListResponse({
         products,
-        meta: {
-            radius: radiusNum,
-            location: lat && lng ? { lat: parseFloat(lat), lng: parseFloat(lng) } : null,
-        },
+        total,
+        pageNum,
+        limitNum,
+        radiusNum,
+        customerLat,
+        customerLng,
     });
+
+    setCacheEntry(cacheKey, responseBody, PRODUCT_LIST_CACHE_TTL_SECONDS);
+    res.set('X-Cache', 'MISS');
+    res.json(responseBody);
 }));
 
 // GET /api/products/featured
 router.get('/featured', asyncHandler(async (req, res) => {
     const { lat, lng, limit = 8 } = req.query;
+    const limitNum = parsePositiveInt(limit, 8, 24);
     const query = { isActive: true, isApproved: true, isFeatured: true, stock: { $gt: 0 } };
 
     let products;
@@ -346,12 +502,15 @@ router.get('/featured', asyncHandler(async (req, res) => {
                     query,
                 },
             },
-            { $limit: parseInt(limit) },
+            { $limit: limitNum },
             { $lookup: { from: 'vendors', localField: 'vendorId', foreignField: '_id', as: 'vendor' } },
             { $unwind: { path: '$vendor', preserveNullAndEmptyArrays: true } },
         ]);
     } else {
-        products = await Product.find(query).limit(parseInt(limit)).populate('vendorId', 'storeName storeLogo').lean();
+        products = await Product.find(query)
+            .limit(limitNum)
+            .populate('vendorId', 'storeName storeLogo')
+            .lean();
     }
 
     res.json({
@@ -366,14 +525,17 @@ router.get('/featured', asyncHandler(async (req, res) => {
 router.get('/search', asyncHandler(async (req, res) => {
     const { q, lat, lng, limit = 10 } = req.query;
     if (!q) return res.json({ success: true, products: [] });
+    const limitNum = parsePositiveInt(limit, 10, 50);
+    const searchTerm = clean(q).slice(0, 80);
+    const safeRegex = new RegExp(escapeRegex(searchTerm), 'i');
 
     const searchQuery = {
         isActive: true, isApproved: true, stock: { $gt: 0 },
         $or: [
-            { title: { $regex: q, $options: 'i' } },
-            { description: { $regex: q, $options: 'i' } },
-            { tags: { $in: [new RegExp(q, 'i')] } },
-            { categoryName: { $regex: q, $options: 'i' } },
+            { title: safeRegex },
+            { description: safeRegex },
+            { tags: { $in: [safeRegex] } },
+            { categoryName: safeRegex },
         ],
     };
 
@@ -392,17 +554,20 @@ router.get('/search', asyncHandler(async (req, res) => {
             {
                 $match: {
                     $or: [
-                        { title: { $regex: q, $options: 'i' } },
-                        { description: { $regex: q, $options: 'i' } },
-                        { tags: { $in: [new RegExp(q, 'i')] } },
-                        { categoryName: { $regex: q, $options: 'i' } },
+                        { title: safeRegex },
+                        { description: safeRegex },
+                        { tags: { $in: [safeRegex] } },
+                        { categoryName: safeRegex },
                     ],
                 },
             },
-            { $limit: parseInt(limit) },
+            { $limit: limitNum },
         ]);
     } else {
-        products = await Product.find(searchQuery).limit(parseInt(limit)).lean();
+        products = await Product.find(searchQuery)
+            .select(PRODUCT_LIST_SELECT)
+            .limit(limitNum)
+            .lean();
     }
 
     res.json({ success: true, products });
@@ -532,8 +697,8 @@ router.get('/:id', asyncHandler(async (req, res) => {
         return res.status(403).json({ success: false, message: 'Store is currently closed' });
     }
 
-    // Increment view count
-    await Product.findByIdAndUpdate(req.params.id, { $inc: { viewCount: 1 } });
+    // View count should not slow down the primary read path.
+    Product.findByIdAndUpdate(req.params.id, { $inc: { viewCount: 1 } }).catch(() => {});
 
     res.json({ success: true, product });
 }));
@@ -719,6 +884,8 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         .filter((vendor) => !duplicateVendors.has(String(vendor._id)))
         .map((vendor) => ({ _id: vendor._id, storeName: vendor.storeName }));
 
+    invalidateProductCache();
+
     res.status(201).json({
         success: true,
         product: createdList.length === 1 ? createdList[0] : undefined,
@@ -860,6 +1027,7 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
         await Vendor.findByIdAndUpdate(targetVendor._id, { $inc: { totalProducts: 1 } });
     }
+    invalidateProductCache();
     res.json({ success: true, product: updated });
 }));
 
@@ -877,6 +1045,7 @@ router.delete('/:id', protect, authorize('vendor', 'admin'), asyncHandler(async 
 
     await product.deleteOne();
     await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
+    invalidateProductCache();
     res.json({ success: true, message: 'Product deleted' });
 }));
 
@@ -952,6 +1121,7 @@ router.post('/bulk-upload', protect, authorize('vendor', 'admin'), uploadCSV.sin
         }
     }
 
+    invalidateProductCache();
     res.json({
         success: true,
         inserted: inserted.length,

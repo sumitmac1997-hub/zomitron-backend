@@ -138,6 +138,12 @@ productSchema.index({ location: '2dsphere' });
 productSchema.index({ vendorId: 1, isActive: 1 });
 productSchema.index({ sourceProductId: 1, vendorId: 1 });
 productSchema.index({ categories: 1 });
+productSchema.index({ isActive: 1, isApproved: 1, stock: 1, createdAt: -1 });
+productSchema.index({ isActive: 1, isApproved: 1, stock: 1, price: 1 });
+productSchema.index({ isActive: 1, isApproved: 1, stock: 1, 'ratings.average': -1 });
+productSchema.index({ isFeatured: 1, isActive: 1, isApproved: 1, stock: 1 });
+productSchema.index({ category: 1, isActive: 1, isApproved: 1, stock: 1, createdAt: -1 });
+productSchema.index({ pincode: 1, isActive: 1, isApproved: 1, stock: 1, createdAt: -1 });
 // Full-text search across key merchandising fields
 productSchema.index({
     title: 'text',

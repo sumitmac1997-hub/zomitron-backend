@@ -47,16 +47,22 @@ jest.mock('../config/cloudinary', () => ({
 
 const Product = require('../models/Product');
 const Vendor = require('../models/Vendor');
+const Category = require('../models/Category');
 const productRouter = require('../routes/product');
 
-const makeLeanChain = (result) => ({
-    populate: jest.fn().mockReturnThis(),
-    sort: jest.fn().mockReturnThis(),
-    skip: jest.fn().mockReturnThis(),
-    limit: jest.fn().mockReturnThis(),
-    select: jest.fn().mockReturnThis(),
-    lean: jest.fn().mockResolvedValue(result),
-});
+const makeLeanChain = (result) => {
+    const chain = {
+        populate: jest.fn().mockReturnThis(),
+        sort: jest.fn().mockReturnThis(),
+        skip: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        select: jest.fn().mockReturnThis(),
+        lean: jest.fn().mockReturnThis(),
+        then: (resolve, reject) => Promise.resolve(result).then(resolve, reject),
+        catch: (reject) => Promise.resolve(result).catch(reject),
+    };
+    return chain;
+};
 
 const makeSelectChain = (result) => ({
     select: jest.fn().mockResolvedValue(result),
@@ -102,6 +108,10 @@ const invokeRoute = async ({ path, method, headers = {}, query = {}, body = {}, 
             },
             setHeader(name, value) {
                 this.headers[name] = value;
+            },
+            set(name, value) {
+                this.headers[name] = value;
+                return this;
             },
         };
 
@@ -177,6 +187,23 @@ describe('Product library and clone routes', () => {
         expect(res.body.products[0]).toEqual(expect.objectContaining({
             canonicalSourceId: 'catalog-root',
             alreadyAdded: true,
+        }));
+    });
+
+    test('GET /api/products treats category=all as no category filter', async () => {
+        Product.find.mockReturnValueOnce(makeLeanChain([]));
+        Product.countDocuments.mockResolvedValueOnce(0);
+
+        const res = await invokeRoute({
+            path: '/',
+            method: 'get',
+            query: { category: 'all', page: '1', limit: '20' },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(Category.findOne).not.toHaveBeenCalled();
+        expect(Product.countDocuments).toHaveBeenCalledWith(expect.not.objectContaining({
+            $or: expect.anything(),
         }));
     });
 

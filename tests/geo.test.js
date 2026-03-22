@@ -6,10 +6,10 @@ describe('Haversine Distance', () => {
         expect(haversineDistance(25.4358, 81.8463, 25.4358, 81.8463)).toBe(0);
     });
 
-    test('Distance Prayagraj to Kanpur (~130km)', () => {
+    test('Distance Prayagraj to Kanpur (~189km)', () => {
         const dist = haversineDistance(25.4358, 81.8463, 26.4499, 80.3319);
-        expect(dist).toBeGreaterThan(120);
-        expect(dist).toBeLessThan(160);
+        expect(dist).toBeGreaterThan(180);
+        expect(dist).toBeLessThan(200);
     });
 
     test('Distance Prayagraj to Varanasi (~130km)', () => {
@@ -18,10 +18,10 @@ describe('Haversine Distance', () => {
         expect(dist).toBeLessThan(150);
     });
 
-    test('Distance Prayagraj to Bangalore (~1600km)', () => {
+    test('Distance Prayagraj to Bangalore (~1456km)', () => {
         const dist = haversineDistance(25.4358, 81.8463, 12.9716, 77.5946);
-        expect(dist).toBeGreaterThan(1500);
-        expect(dist).toBeLessThan(1800);
+        expect(dist).toBeGreaterThan(1400);
+        expect(dist).toBeLessThan(1500);
     });
 
     test('isWithinRadius - nearby vendor (true)', () => {

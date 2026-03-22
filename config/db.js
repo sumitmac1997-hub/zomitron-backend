@@ -61,8 +61,12 @@ const connectDB = async () => {
             dbName,
             serverSelectionTimeoutMS: Number(process.env.MONGO_TIMEOUT_MS) || 15000,
             socketTimeoutMS: Number(process.env.MONGO_SOCKET_TIMEOUT_MS) || 20000,
+            minPoolSize: Number(process.env.MONGO_MIN_POOL_SIZE) || 10,
             maxPoolSize: Number(process.env.MONGO_MAX_POOL_SIZE) || 20,
+            maxIdleTimeMS: Number(process.env.MONGO_MAX_IDLE_MS) || 60000,
+            waitQueueTimeoutMS: Number(process.env.MONGO_WAIT_QUEUE_TIMEOUT_MS) || 5000,
             appName: process.env.MONGO_APP_NAME || 'zomitron-api',
+            autoIndex: process.env.NODE_ENV !== 'production',
         });
         console.log(`✅ MongoDB Connected (${label}): ${conn.connection.host}/${conn.connection.name}`);
     };
@@ -82,6 +86,12 @@ const connectDB = async () => {
         };
 
         await safeCreateIndex('products', { location: '2dsphere' });
+        await safeCreateIndex('products', { isActive: 1, isApproved: 1, stock: 1, createdAt: -1 }, { name: 'products_public_listing_idx' });
+        await safeCreateIndex('products', { isActive: 1, isApproved: 1, stock: 1, price: 1 }, { name: 'products_public_price_idx' });
+        await safeCreateIndex('products', { isActive: 1, isApproved: 1, stock: 1, 'ratings.average': -1 }, { name: 'products_public_rating_idx' });
+        await safeCreateIndex('products', { isFeatured: 1, isActive: 1, isApproved: 1, stock: 1 }, { name: 'products_featured_idx' });
+        await safeCreateIndex('products', { category: 1, isActive: 1, isApproved: 1, stock: 1, createdAt: -1 }, { name: 'products_category_listing_idx' });
+        await safeCreateIndex('products', { pincode: 1, isActive: 1, isApproved: 1, stock: 1, createdAt: -1 }, { name: 'products_pincode_listing_idx' });
         await safeCreateIndex('products', {
             title: 'text',
             description: 'text',

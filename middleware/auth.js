@@ -4,16 +4,16 @@ const User = require('../models/User');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret_change_me';
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || JWT_SECRET;
+const getBearerToken = (req) => {
+    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
+        return req.headers.authorization.split(' ')[1];
+    }
+    return req.cookies?.token || null;
+};
 
 // Verify JWT and attach user to request
 const protect = asyncHandler(async (req, res, next) => {
-    let token;
-
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-        token = req.headers.authorization.split(' ')[1];
-    } else if (req.cookies?.token) {
-        token = req.cookies.token;
-    }
+    const token = getBearerToken(req);
 
     if (!token) {
         return res.status(401).json({ success: false, message: 'Not authorized, token missing' });
@@ -21,7 +21,9 @@ const protect = asyncHandler(async (req, res, next) => {
 
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        req.user = await User.findById(decoded.id).select('-password -otp -otpExpiry -refreshToken');
+        req.user = await User.findById(decoded.id)
+            .select('-password -otp -otpExpiry -refreshToken')
+            .lean();
         if (!req.user) {
             return res.status(401).json({ success: false, message: 'User not found' });
         }
@@ -49,14 +51,14 @@ const authorize = (...roles) => {
 
 // Optional auth (doesn't fail if no token)
 const optionalAuth = asyncHandler(async (req, res, next) => {
-    let token;
-    if (req.headers.authorization && req.headers.authorization.startsWith('Bearer')) {
-        token = req.headers.authorization.split(' ')[1];
-    }
+    const token = getBearerToken(req);
     if (token) {
         try {
             const decoded = jwt.verify(token, JWT_SECRET);
-            req.user = await User.findById(decoded.id).select('-password');
+            req.user = await User.findById(decoded.id).select('-password').lean();
+            if (req.user && req.user.isActive === false) {
+                req.user = null;
+            }
         } catch {
             req.user = null;
         }

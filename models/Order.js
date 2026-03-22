@@ -15,7 +15,7 @@ const orderSchema = new mongoose.Schema(
         customerId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'User',
-            required: true,
+            default: null,
         },
         orderNumber: { type: String, unique: true },
         items: [orderItemSchema],
@@ -60,7 +60,6 @@ const orderSchema = new mongoose.Schema(
         deliveryETA: { type: String }, // e.g. "2 hours", "1 day"
         estimatedDelivery: Date,
         deliveryDistance: Number, // km from vendor
-        deliveryCharge: Number,
         shippingRule: {
             ruleId: { type: mongoose.Schema.Types.ObjectId, ref: 'ShippingRule', default: null },
             city: String,
@@ -146,8 +145,10 @@ const orderSchema = new mongoose.Schema(
 // Indexes
 orderSchema.index({ customerId: 1, createdAt: -1 });
 orderSchema.index({ vendorIds: 1, createdAt: -1 });
-orderSchema.index({ orderStatus: 1 });
-orderSchema.index({ orderNumber: 1 });
+orderSchema.index({ orderStatus: 1, createdAt: -1 });
+orderSchema.index({ paymentStatus: 1, createdAt: -1 });
+orderSchema.index({ refundStatus: 1, createdAt: -1 });
+orderSchema.index({ 'vendorFulfillments.vendorId': 1, createdAt: -1 });
 
 // Auto-generate order number
 orderSchema.pre('save', function (next) {

@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const asyncHandler = require('express-async-handler');
+const mongoose = require('mongoose');
 const Order = require('../models/Order');
 const Product = require('../models/Product');
 const Vendor = require('../models/Vendor');
@@ -11,81 +12,260 @@ const { protect, optionalAuth, authorize } = require('../middleware/auth');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo, getEstimatedDeliveryDate } = require('../utils/deliveryETA');
 const { calculateMultiVendorPayouts } = require('../utils/commission');
-const { normalizeCity, calculateShippingQuote } = require('../utils/shippingRules');
+const { calculateShippingQuote } = require('../utils/shippingRules');
 const { getSettingValue } = require('../utils/settings');
 
-// (Removed ensureDefaultShippingRule)
+const MAX_ORDER_ITEMS = Number(process.env.MAX_ORDER_ITEMS) || 25;
+const VALID_PAYMENT_METHODS = new Set(['stripe', 'razorpay', 'paypal', 'cod']);
 
-// POST /api/orders — Create order
-router.post('/', optionalAuth, asyncHandler(async (req, res) => {
-    const { items, deliveryAddress, paymentMethod, couponCode, guestEmail, guestPhone } = req.body;
-    const orderEmail = guestEmail || req.user?.email;
+const clean = (value) => (value ?? '').toString().trim();
+const normalizeEmail = (value) => clean(value).toLowerCase();
+const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(value || ''));
+const isValidIndianPhone = (value) => {
+    const digits = String(value || '').replace(/\D/g, '');
+    return digits.length === 10 || (digits.length === 12 && digits.startsWith('91'));
+};
+const isValidPincode = (value) => /^\d{6}$/.test(String(value || ''));
 
-    if (!items || items.length === 0) return res.status(400).json({ success: false, message: 'No items in order' });
-    if (!deliveryAddress) return res.status(400).json({ success: false, message: 'Delivery address required' });
-    if (!req.user && !orderEmail) return res.status(400).json({ success: false, message: 'Login or provide guest email' });
+const createHttpError = (statusCode, message) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+};
 
-    // Validate products and build order items
+const normalizeOrderItems = (items) => {
+    if (!Array.isArray(items) || items.length === 0) {
+        throw createHttpError(400, 'No items in order');
+    }
+
+    if (items.length > MAX_ORDER_ITEMS) {
+        throw createHttpError(400, `Order cannot contain more than ${MAX_ORDER_ITEMS} distinct line items`);
+    }
+
+    const mergedItems = new Map();
+
+    for (const rawItem of items) {
+        const productId = clean(rawItem?.productId);
+        const qty = Number.parseInt(rawItem?.qty, 10);
+
+        if (!productId || !Number.isInteger(qty) || qty <= 0) {
+            throw createHttpError(400, 'Each order item must include a valid productId and positive qty');
+        }
+
+        mergedItems.set(productId, (mergedItems.get(productId) || 0) + qty);
+    }
+
+    return Array.from(mergedItems.entries()).map(([productId, qty]) => ({ productId, qty }));
+};
+
+const normalizeDeliveryAddress = (deliveryAddress, orderEmail, fallbackPhone) => {
+    if (!deliveryAddress || typeof deliveryAddress !== 'object') {
+        throw createHttpError(400, 'Delivery address required');
+    }
+
+    const normalizedAddress = {
+        name: clean(deliveryAddress.name),
+        email: normalizeEmail(deliveryAddress.email || orderEmail),
+        phone: clean(deliveryAddress.phone || fallbackPhone),
+        line1: clean(deliveryAddress.line1),
+        line2: clean(deliveryAddress.line2),
+        city: clean(deliveryAddress.city),
+        state: clean(deliveryAddress.state),
+        pincode: clean(deliveryAddress.pincode),
+        lat: deliveryAddress.lat === undefined || deliveryAddress.lat === '' ? undefined : Number(deliveryAddress.lat),
+        lng: deliveryAddress.lng === undefined || deliveryAddress.lng === '' ? undefined : Number(deliveryAddress.lng),
+    };
+
+    if (!normalizedAddress.line1 || !normalizedAddress.city || !normalizedAddress.state || !isValidPincode(normalizedAddress.pincode)) {
+        throw createHttpError(400, 'Delivery address must include line1, city, state, and a valid 6-digit pincode');
+    }
+
+    if (!normalizedAddress.email || !isValidEmail(normalizedAddress.email)) {
+        throw createHttpError(400, 'A valid order email is required');
+    }
+
+    if (!normalizedAddress.phone || !isValidIndianPhone(normalizedAddress.phone)) {
+        throw createHttpError(400, 'A valid phone number is required for delivery');
+    }
+
+    if ((normalizedAddress.lat !== undefined && !Number.isFinite(normalizedAddress.lat))
+        || (normalizedAddress.lng !== undefined && !Number.isFinite(normalizedAddress.lng))) {
+        throw createHttpError(400, 'Latitude and longitude must be valid numbers');
+    }
+
+    return normalizedAddress;
+};
+
+const buildOrderItems = (normalizedItems, productsById) => {
     const orderItems = [];
-    const vendorIds = new Set();
     let subtotal = 0;
 
-    for (const item of items) {
-        const product = await Product.findById(item.productId);
-        if (!product || !product.isActive || product.stock < item.qty) {
-            return res.status(400).json({ success: false, message: `Product ${item.productId} unavailable or insufficient stock` });
+    for (const item of normalizedItems) {
+        const product = productsById.get(item.productId);
+        if (!product || !product.isActive) {
+            throw createHttpError(404, `Product ${item.productId} not found`);
         }
+
+        if (product.stock < item.qty) {
+            throw createHttpError(409, `Product ${item.productId} has insufficient stock`);
+        }
+
         const price = product.discountPrice || product.price;
         orderItems.push({
             productId: product._id,
             vendorId: product.vendorId,
             title: product.title,
-            image: product.images[0],
+            image: product.images?.[0],
             price,
             qty: item.qty,
             subtotal: price * item.qty,
         });
-        vendorIds.add(product.vendorId.toString());
         subtotal += price * item.qty;
     }
 
-    // Get vendor commission rates
-    const vendorIdArray = Array.from(vendorIds);
-    const vendors = await Vendor.find({ _id: { $in: vendorIdArray } }).select('_id commissionRate city location');
-    const commissionRates = {};
-    vendors.forEach(v => { commissionRates[v._id.toString()] = v.commissionRate; });
+    return { orderItems, subtotal };
+};
 
-    // Calculate delivery info (use first vendor location vs delivery address)
+const isTransactionUnsupportedError = (error) => /Transaction numbers are only allowed on a replica set member or mongos|does not support transactions|replica set/i.test(error?.message || '');
+
+const reserveStockWithoutTransaction = async (orderItems) => {
+    const reserved = [];
+
+    const rollback = async () => {
+        if (reserved.length === 0) return;
+        await Product.bulkWrite(
+            reserved.map((item) => ({
+                updateOne: {
+                    filter: { _id: item.productId },
+                    update: { $inc: { stock: item.qty, orderCount: -item.qty } },
+                },
+            })),
+            { ordered: false },
+        );
+    };
+
+    for (const item of orderItems) {
+        const updatedProduct = await Product.findOneAndUpdate(
+            {
+                _id: item.productId,
+                isActive: true,
+                stock: { $gte: item.qty },
+            },
+            {
+                $inc: { stock: -item.qty, orderCount: item.qty },
+            },
+            { new: true },
+        );
+
+        if (!updatedProduct) {
+            await rollback();
+            throw createHttpError(409, `Product ${item.productId} became unavailable during checkout`);
+        }
+
+        reserved.push({ productId: item.productId, qty: item.qty });
+    }
+
+    return rollback;
+};
+
+const syncAddressToUser = async (userId, deliveryAddress, session) => {
+    if (!userId) return null;
+
+    const user = session
+        ? await User.findById(userId).session(session)
+        : await User.findById(userId);
+
+    if (!user) return null;
+
+    const addresses = Array.isArray(user.addresses) ? user.addresses : [];
+    const addressExists = addresses.some((addr) => (
+        clean(addr.line1).toLowerCase() === deliveryAddress.line1.toLowerCase()
+        && clean(addr.city).toLowerCase() === deliveryAddress.city.toLowerCase()
+        && clean(addr.pincode) === deliveryAddress.pincode
+    ));
+
+    if (addressExists) {
+        return user.toObject();
+    }
+
+    user.addresses.push({
+        label: 'Saved Address',
+        line1: deliveryAddress.line1,
+        line2: deliveryAddress.line2 || '',
+        city: deliveryAddress.city,
+        state: deliveryAddress.state,
+        pincode: deliveryAddress.pincode,
+        lat: deliveryAddress.lat,
+        lng: deliveryAddress.lng,
+        isDefault: addresses.length === 0,
+    });
+
+    await user.save({ session, validateBeforeSave: false });
+    return user.toObject();
+};
+
+// POST /api/orders — Create order
+router.post('/', optionalAuth, asyncHandler(async (req, res) => {
+    const { items, deliveryAddress, paymentMethod, couponCode, guestEmail, guestPhone } = req.body;
+    const normalizedItems = normalizeOrderItems(items);
+    const orderEmail = normalizeEmail(guestEmail || req.user?.email);
+    if (!req.user && !orderEmail) return res.status(400).json({ success: false, message: 'Login or provide guest email' });
+
+    const paymentMethodValue = clean(paymentMethod || 'cod').toLowerCase();
+    if (!VALID_PAYMENT_METHODS.has(paymentMethodValue)) {
+        return res.status(400).json({ success: false, message: 'Invalid payment method' });
+    }
+
+    const normalizedAddress = normalizeDeliveryAddress(deliveryAddress, orderEmail, guestPhone);
+    const productIds = normalizedItems.map((item) => item.productId);
+    const products = await Product.find({ _id: { $in: productIds } })
+        .select('_id vendorId title images price discountPrice stock isActive')
+        .lean();
+
+    if (products.length !== productIds.length) {
+        return res.status(404).json({ success: false, message: 'One or more products were not found' });
+    }
+
+    const productsById = new Map(products.map((product) => [String(product._id), product]));
+    const { orderItems, subtotal } = buildOrderItems(normalizedItems, productsById);
+    const vendorIdArray = [...new Set(orderItems.map((item) => String(item.vendorId)))];
+
+    const [vendors, coupon, ruleList, refundWindowDays] = await Promise.all([
+        Vendor.find({ _id: { $in: vendorIdArray } }).select('_id commissionRate city location').lean(),
+        couponCode ? Coupon.findOne({ code: clean(couponCode).toUpperCase(), isActive: true }) : Promise.resolve(null),
+        ShippingRule.find({ isActive: true }).sort({ updatedAt: -1 }).lean(),
+        getSettingValue('refundWindowDays', 5),
+    ]);
+
+    if (vendors.length !== vendorIdArray.length) {
+        return res.status(400).json({ success: false, message: 'One or more vendors for this order are unavailable' });
+    }
+
+    const commissionRates = Object.fromEntries(vendors.map((vendor) => [String(vendor._id), vendor.commissionRate]));
+
     let deliveryDistance = 0;
     let deliveryInfo = { eta: '3-5 days', etaLabel: 'Standard Delivery', deliveryCharge: 0 };
-    if (deliveryAddress.lat && deliveryAddress.lng && vendors[0]?.location?.coordinates) {
+    if (normalizedAddress.lat !== undefined && normalizedAddress.lng !== undefined && vendors[0]?.location?.coordinates) {
         const [vendorLng, vendorLat] = vendors[0].location.coordinates;
-        deliveryDistance = haversineDistance(deliveryAddress.lat, deliveryAddress.lng, vendorLat, vendorLng);
+        deliveryDistance = haversineDistance(normalizedAddress.lat, normalizedAddress.lng, vendorLat, vendorLng);
         deliveryInfo = getDeliveryInfo(deliveryDistance);
     }
 
-    // Apply coupon
     let discount = 0;
     let appliedCoupon = null;
-    if (couponCode) {
-        const coupon = await Coupon.findOne({ code: couponCode.toUpperCase() });
-        if (coupon) {
-            const validation = coupon.validate(req.user?._id, subtotal);
-            if (validation.valid) {
-                discount = coupon.calculateDiscount(subtotal);
-                appliedCoupon = coupon;
-            }
+    if (coupon) {
+        const validation = coupon.validateCoupon(req.user?._id, subtotal);
+        if (validation.valid) {
+            discount = coupon.calculateDiscount(subtotal);
+            appliedCoupon = coupon;
         }
     }
 
     const { platformTotal, vendorPayouts } = calculateMultiVendorPayouts(orderItems, commissionRates);
 
-    // Fetch all active rules and let matcher decide
-    const ruleList = await ShippingRule.find({ isActive: true }).sort({ updatedAt: -1 }).lean();
-
     const shippingQuote = calculateShippingQuote({
-        city: deliveryAddress.city,
-        pincode: deliveryAddress.pincode,
+        city: normalizedAddress.city,
+        pincode: normalizedAddress.pincode,
         subtotal,
         discount,
     }, ruleList);
@@ -99,13 +279,10 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
     }
 
     const total = Math.max(0, subtotal - discount + shippingQuote.shippingCharge);
-    const refundWindowDays = await getSettingValue('refundWindowDays', 5);
-
-    // Create order
-    const order = await Order.create({
-        customerId: req.user?._id,
+    const orderPayload = {
+        customerId: req.user?._id || null,
         guestEmail: orderEmail,
-        guestPhone,
+        guestPhone: normalizedAddress.phone,
         items: orderItems,
         vendorIds: vendorIdArray,
         subtotal,
@@ -114,16 +291,16 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         discount,
         total,
         vendorPayouts,
-        couponCode,
-        paymentMethod: paymentMethod || 'cod',
-        paymentStatus: paymentMethod === 'cod' ? 'pending' : 'pending',
-        deliveryAddress,
+        couponCode: clean(couponCode).toUpperCase() || undefined,
+        paymentMethod: paymentMethodValue,
+        paymentStatus: 'pending',
+        deliveryAddress: normalizedAddress,
         deliveryETA: deliveryInfo.eta,
         estimatedDelivery: getEstimatedDeliveryDate(deliveryDistance),
         deliveryDistance,
         shippingRule: {
             ruleId: shippingQuote.ruleId,
-            city: shippingQuote.city || deliveryAddress.city,
+            city: shippingQuote.city || normalizedAddress.city,
             freeShippingThreshold: shippingQuote.freeShippingThreshold,
             baseShippingCharge: shippingQuote.baseShippingCharge,
             appliedCharge: shippingQuote.shippingCharge,
@@ -132,57 +309,86 @@ router.post('/', optionalAuth, asyncHandler(async (req, res) => {
         },
         vendorFulfillments: vendorIdArray.map(vid => ({ vendorId: vid, status: 'pending' })),
         refundWindowDays: Number(refundWindowDays) || 5,
-    });
+    };
 
-    // Reduce stock
-    for (const item of orderItems) {
-        await Product.findByIdAndUpdate(item.productId, { $inc: { stock: -item.qty, orderCount: 1 } });
-    }
-
-    // Save new address to user profile
     let updatedUser = null;
-    if (req.user) {
+    const stockOperations = orderItems.map((item) => ({
+        updateOne: {
+            filter: {
+                _id: item.productId,
+                isActive: true,
+                stock: { $gte: item.qty },
+            },
+            update: { $inc: { stock: -item.qty, orderCount: item.qty } },
+        },
+    }));
+
+    let order;
+    const session = await mongoose.startSession();
+    try {
+        let transactionSupported = true;
+
         try {
-            const user = await User.findById(req.user._id);
-            if (user) {
-                const addressExists = user.addresses.some(
-                    (addr) =>
-                        addr.line1.toLowerCase().trim() === deliveryAddress.line1.toLowerCase().trim() &&
-                        addr.city.toLowerCase().trim() === deliveryAddress.city.toLowerCase().trim() &&
-                        addr.pincode === deliveryAddress.pincode
-                );
-                
-                if (!addressExists) {
-                    const newAddress = {
-                        label: 'Saved Address',
-                        line1: deliveryAddress.line1,
-                        line2: deliveryAddress.line2 || '',
-                        city: deliveryAddress.city,
-                        state: deliveryAddress.state,
-                        pincode: deliveryAddress.pincode,
-                        lat: deliveryAddress.lat,
-                        lng: deliveryAddress.lng,
-                        isDefault: user.addresses.length === 0, // Make default if it's their first address
-                    };
-                    user.addresses.push(newAddress);
-                    updatedUser = await user.save();
+            await session.withTransaction(async () => {
+                const stockResult = await Product.bulkWrite(stockOperations, { session, ordered: true });
+                if (stockResult.modifiedCount !== orderItems.length) {
+                    throw createHttpError(409, 'One or more items became unavailable during checkout');
                 }
+
+                [order] = await Order.create([orderPayload], { session });
+                updatedUser = await syncAddressToUser(req.user?._id, normalizedAddress, session);
+
+                if (appliedCoupon) {
+                    await Coupon.updateOne(
+                        { _id: appliedCoupon._id },
+                        {
+                            $inc: { usedCount: 1 },
+                            ...(req.user ? { $addToSet: { usedBy: req.user._id } } : {}),
+                        },
+                        { session },
+                    );
+                }
+
+                await Vendor.updateMany(
+                    { _id: { $in: vendorIdArray } },
+                    { $inc: { totalOrders: 1 } },
+                    { session },
+                );
+            });
+        } catch (error) {
+            if (!isTransactionUnsupportedError(error)) {
+                throw error;
             }
-        } catch (err) {
-            console.error('Error auto-saving address to user profile:', err);
-            // Non-fatal error, do not block order success
+
+            transactionSupported = false;
         }
-    }
 
-    // Update coupon usage
-    if (appliedCoupon) {
-        appliedCoupon.usedCount += 1;
-        if (req.user) appliedCoupon.usedBy.push(req.user._id);
-        await appliedCoupon.save();
-    }
+        if (!transactionSupported) {
+            const rollbackStock = await reserveStockWithoutTransaction(orderItems);
+            try {
+                order = await Order.create(orderPayload);
+                updatedUser = await syncAddressToUser(req.user?._id, normalizedAddress);
 
-    // Update vendor stats
-    await Vendor.updateMany({ _id: { $in: vendorIdArray } }, { $inc: { totalOrders: 1 } });
+                await Promise.all([
+                    appliedCoupon
+                        ? Coupon.updateOne(
+                            { _id: appliedCoupon._id },
+                            {
+                                $inc: { usedCount: 1 },
+                                ...(req.user ? { $addToSet: { usedBy: req.user._id } } : {}),
+                            },
+                        )
+                        : Promise.resolve(),
+                    Vendor.updateMany({ _id: { $in: vendorIdArray } }, { $inc: { totalOrders: 1 } }),
+                ]);
+            } catch (error) {
+                await rollbackStock();
+                throw error;
+            }
+        }
+    } finally {
+        await session.endSession();
+    }
 
     // Real-time notifications
     const io = req.app.get('io');

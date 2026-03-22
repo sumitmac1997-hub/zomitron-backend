@@ -38,18 +38,19 @@ const couponSchema = new mongoose.Schema(
     { timestamps: true }
 );
 
-couponSchema.index({ code: 1 });
 couponSchema.index({ expiresAt: 1 });
 couponSchema.index({ vendorId: 1 });
 
 // Validate coupon
-couponSchema.methods.validate = function (userId, orderAmount) {
+couponSchema.methods.validateCoupon = function (userId, orderAmount) {
     if (!this.isActive) return { valid: false, message: 'Coupon is inactive' };
     if (new Date() > this.expiresAt) return { valid: false, message: 'Coupon has expired' };
     if (this.usageLimit && this.usedCount >= this.usageLimit) return { valid: false, message: 'Coupon usage limit reached' };
     if (orderAmount < this.minOrderAmount) return { valid: false, message: `Minimum order amount is ₹${this.minOrderAmount}` };
-    const userUsed = this.usedBy.filter((id) => id.toString() === userId.toString()).length;
-    if (userUsed >= this.perUserLimit) return { valid: false, message: 'You have already used this coupon' };
+    if (userId) {
+        const userUsed = this.usedBy.filter((id) => id.toString() === userId.toString()).length;
+        if (userUsed >= this.perUserLimit) return { valid: false, message: 'You have already used this coupon' };
+    }
     return { valid: true };
 };
 
