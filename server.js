@@ -12,6 +12,7 @@ const mongoose = require('mongoose');
 const { randomUUID } = require('crypto');
 const { syncDefaultCategories } = require('./utils/syncDefaultCategories');
 const { initMonitoring, captureException, captureMessage } = require('./utils/monitoring');
+const { connectRedis, disconnectRedis } = require('./redis');
 
 // Load env
 dotenv.config();
@@ -250,6 +251,11 @@ const registerShutdownHandlers = () => {
 
     server.close(async () => {
       try {
+        await disconnectRedis();
+      } catch (error) {
+        console.error('Error while closing Redis connection:', error.message);
+      }
+      try {
         await mongoose.connection.close(false);
       } catch (error) {
         console.error('Error while closing Mongo connection:', error.message);
@@ -271,6 +277,7 @@ if (process.env.NODE_ENV !== 'test') {
   const bootstrap = async () => {
     try {
       await connectDB();
+      await connectRedis();
       try {
         await syncDefaultCategories();
       } catch (err) {

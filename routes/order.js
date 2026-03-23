@@ -438,7 +438,7 @@ router.get('/my', protect, asyncHandler(async (req, res) => {
 router.get('/:id', optionalAuth, asyncHandler(async (req, res) => {
     const isAdmin = req.user?.role === 'admin';
     const vendorFields = isAdmin
-        ? 'storeName storeLogo phone email address city state pincode'
+        ? 'storeName storeLogo phone email address city state pincode location'
         : 'storeName storeLogo phone';
 
     const order = await Order.findById(req.params.id)

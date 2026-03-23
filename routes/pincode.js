@@ -9,8 +9,7 @@ const { localPincodes } = require('../utils/localPincodes');
 const { buildCacheKey, getCacheEntry, setCacheEntry } = require('../utils/cache');
 
 const PINCODE_CACHE_PREFIX = 'pincode';
-const PINCODE_CACHE_TTL_SECONDS = Number(process.env.PINCODE_CACHE_TTL_SECONDS) || 60 * 10;
-const PINCODE_SEARCH_CACHE_TTL_SECONDS = Number(process.env.PINCODE_SEARCH_CACHE_TTL_SECONDS) || 60;
+const PINCODE_CACHE_TTL_SECONDS = Number(process.env.REDIS_CACHE_TTL_SECONDS) || 60;
 
 const clean = (value) => (value ?? '').toString().trim();
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -42,10 +41,6 @@ router.get('/search', asyncHandler(async (req, res) => {
 
     if (!query) return res.status(400).json({ success: false, message: 'Search query required' });
 
-    const cacheKey = buildCacheKey(`${PINCODE_CACHE_PREFIX}:search`, { query, limit });
-    const cached = getCacheEntry(cacheKey);
-    if (cached) return res.json(cached);
-
     const safeRegex = new RegExp(escapeRegex(query), 'i');
     const pincodes = await Pincode.find({
         $or: [
@@ -56,7 +51,6 @@ router.get('/search', asyncHandler(async (req, res) => {
     }).limit(limit).lean();
 
     const response = { success: true, pincodes };
-    setCacheEntry(cacheKey, response, PINCODE_SEARCH_CACHE_TTL_SECONDS);
     res.json(response);
 }));
 
@@ -69,15 +63,20 @@ router.get('/:code', asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: 'Invalid pincode format. Must be 6 digits.' });
     }
 
-    const cacheKey = buildCacheKey(`${PINCODE_CACHE_PREFIX}:lookup`, {
-        code,
+    const cacheKey = buildCacheKey(`${PINCODE_CACHE_PREFIX}:${code}`, {
         vendorLat,
         vendorLng,
         customerLat,
         customerLng,
     });
-    const cached = getCacheEntry(cacheKey);
-    if (cached) return res.json(cached);
+    const cached = await getCacheEntry(cacheKey);
+    if (cached) {
+        console.log(`⚡ Cache HIT ${cacheKey}`);
+        res.set('X-Cache', 'HIT');
+        return res.json(cached);
+    }
+
+    console.log(`❌ Cache MISS (DB hit) ${cacheKey}`);
 
     const pincodeData = await resolvePincodeData(code);
     if (!pincodeData) return res.status(404).json({ success: false, message: 'We currently do not deliver to this pincode.' });
@@ -105,7 +104,8 @@ router.get('/:code', asyncHandler(async (req, res) => {
         result.customerDistance = Math.round(customerDistance);
     }
 
-    setCacheEntry(cacheKey, result, PINCODE_CACHE_TTL_SECONDS);
+    await setCacheEntry(cacheKey, result, PINCODE_CACHE_TTL_SECONDS);
+    res.set('X-Cache', 'MISS');
     res.json(result);
 }));
 
@@ -115,10 +115,6 @@ router.post('/validate-delivery', asyncHandler(async (req, res) => {
     if (!/^\d{6}$/.test(fromPincode) || !/^\d{6}$/.test(toPincode)) {
         return res.status(400).json({ success: false, message: 'Both pincodes must be 6 digits' });
     }
-
-    const cacheKey = buildCacheKey(`${PINCODE_CACHE_PREFIX}:validate-delivery`, { fromPincode, toPincode });
-    const cached = getCacheEntry(cacheKey);
-    if (cached) return res.json(cached);
 
     const [from, to] = await Promise.all([
         resolvePincodeData(fromPincode),
@@ -139,7 +135,6 @@ router.post('/validate-delivery', asyncHandler(async (req, res) => {
         deliveryInfo,
     };
 
-    setCacheEntry(cacheKey, response, PINCODE_CACHE_TTL_SECONDS);
     res.json(response);
 }));
 

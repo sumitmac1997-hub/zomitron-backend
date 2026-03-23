@@ -6,9 +6,22 @@ const Product = require('../models/Product');
 const { protect, authorize } = require('../middleware/auth');
 const { uploadVendor, toUploadUrl } = require('../config/cloudinary');
 const { syncDefaultCategories } = require('../utils/syncDefaultCategories');
+const { deleteCacheKey, getCacheEntry, setCacheEntry } = require('../utils/cache');
+
+const CATEGORY_CACHE_KEY = 'categories';
+const CATEGORY_CACHE_TTL_SECONDS = Number(process.env.REDIS_CACHE_TTL_SECONDS) || 60;
 
 // GET /api/categories — All categories (tree structure)
 router.get('/', asyncHandler(async (req, res) => {
+    const cachedCategories = await getCacheEntry(CATEGORY_CACHE_KEY);
+    if (cachedCategories) {
+        console.log(`⚡ Cache HIT ${CATEGORY_CACHE_KEY}`);
+        res.set('X-Cache', 'HIT');
+        return res.json(cachedCategories);
+    }
+
+    console.log(`❌ Cache MISS (DB hit) ${CATEGORY_CACHE_KEY}`);
+
     await syncDefaultCategories();
 
     const all = await Category.find({ isActive: true }).sort({ sortOrder: 1, name: 1 }).lean();
@@ -26,7 +39,11 @@ router.get('/', asyncHandler(async (req, res) => {
         }
     });
 
-    res.json({ success: true, categories: roots });
+    const responseBody = { success: true, categories: roots };
+    await setCacheEntry(CATEGORY_CACHE_KEY, responseBody, CATEGORY_CACHE_TTL_SECONDS);
+
+    res.set('X-Cache', 'MISS');
+    res.json(responseBody);
 }));
 
 // GET /api/categories/flat — All categories flat list
@@ -61,6 +78,8 @@ router.post('/', protect, authorize('admin'), uploadVendor.single('image'), asyn
         parent: parent || null,
         sortOrder: sortOrder || 0,
     });
+
+    await deleteCacheKey(CATEGORY_CACHE_KEY);
     res.status(201).json({ success: true, category });
 }));
 
@@ -70,6 +89,7 @@ router.put('/:id', protect, authorize('admin'), uploadVendor.single('image'), as
     if (req.file) updates.image = toUploadUrl(req.file);
     if (updates.parent === '') updates.parent = null;
     const category = await Category.findByIdAndUpdate(req.params.id, updates, { new: true, runValidators: true });
+    await deleteCacheKey(CATEGORY_CACHE_KEY);
     res.json({ success: true, category });
 }));
 
@@ -78,6 +98,7 @@ router.delete('/:id', protect, authorize('admin'), asyncHandler(async (req, res)
     const hasProducts = await Product.exists({ category: req.params.id });
     if (hasProducts) return res.status(400).json({ success: false, message: 'Cannot delete category with existing products' });
     await Category.findByIdAndDelete(req.params.id);
+    await deleteCacheKey(CATEGORY_CACHE_KEY);
     res.json({ success: true, message: 'Category deleted' });
 }));
 

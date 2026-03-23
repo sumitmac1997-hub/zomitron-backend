@@ -10,14 +10,14 @@ const User = require('../models/User');
 const { protect, authorize } = require('../middleware/auth');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo } = require('../utils/deliveryETA');
-const { buildCacheKey, clearCacheByPrefix, getCacheEntry, setCacheEntry } = require('../utils/cache');
+const { buildCacheKey, clearCacheByPrefix, deleteCacheKey, getCacheEntry, setCacheEntry } = require('../utils/cache');
 const { uploadProduct, uploadCSV, toUploadUrl } = require('../config/cloudinary');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
 
 const PRODUCT_CACHE_PREFIX = 'products';
-const PRODUCT_LIST_CACHE_PREFIX = `${PRODUCT_CACHE_PREFIX}:list`;
-const PRODUCT_LIST_CACHE_TTL_SECONDS = Number(process.env.PRODUCTS_CACHE_TTL_SECONDS) || 15;
+const PRODUCT_LIST_CACHE_PREFIX = PRODUCT_CACHE_PREFIX;
+const PRODUCT_CACHE_TTL_SECONDS = Number(process.env.REDIS_CACHE_TTL_SECONDS) || 60;
 const MAX_PUBLIC_PRODUCTS_LIMIT = Number(process.env.MAX_PUBLIC_PRODUCTS_LIMIT) || 40;
 const EARTH_RADIUS_KM = 6371;
 const PRODUCT_LIST_SELECT = [
@@ -42,6 +42,7 @@ const PRODUCT_LIST_SELECT = [
 ].join(' ');
 const PRODUCT_LIST_VENDOR_SELECT = '_id storeName storeLogo ratings address isOpen approved';
 const PRODUCT_LIST_CATEGORY_SELECT = '_id name slug icon';
+const PRODUCT_SEARCH_SELECT = `${PRODUCT_LIST_SELECT} description shortDescription tags sku attributes variations`;
 
 const clean = (val) => (val ?? '').toString().trim();
 const normalizeNumber = (val) => {
@@ -117,6 +118,36 @@ const parseStringList = (val, splitPattern = /[,|]/) => {
 const parseIdList = (val) => [...new Set(parseStringList(val, /,/))];
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const SEARCH_PHRASE_REPLACEMENTS = [
+    [/t[\s-]*shirts?/g, 'tshirt'],
+    [/tee[\s-]*shirts?/g, 'tshirt'],
+    [/smart[\s-]*phones?/g, 'mobile'],
+    [/cell[\s-]*phones?/g, 'mobile'],
+    [/mens/g, 'men'],
+    [/women'?s/g, 'women'],
+];
+const TOKEN_SYNONYMS = {
+    men: ['men', 'man', 'male', 'boy', 'boys', 'mens'],
+    women: ['women', 'woman', 'female', 'girl', 'girls', 'ladies', 'lady', 'womens'],
+    tshirt: ['tshirt', 'tshirts', 't-shirt', 'tee', 'tees', 'teeshirt', 'teshit', 'teshirt', 'tshrit'],
+    shirt: ['shirt', 'shirts', 'formalshirt', 'casualshirt'],
+    mobile: ['mobile', 'mobiles', 'phone', 'phones', 'smartphone', 'smartphones', 'cellphone', 'cellphones'],
+    laptop: ['laptop', 'laptops', 'notebook', 'notebooks'],
+    earbud: ['earbud', 'earbuds', 'earphone', 'earphones', 'headphone', 'headphones'],
+    shoe: ['shoe', 'shoes', 'sneaker', 'sneakers', 'footwear'],
+    watch: ['watch', 'watches', 'smartwatch', 'smartwatches'],
+};
+const SEARCH_FIELD_BOOSTS = {
+    title: 140,
+    categoryName: 95,
+    tags: 90,
+    sku: 70,
+    shortDescription: 45,
+    description: 30,
+    attributes: 55,
+    variations: 45,
+};
+const SEARCH_STOP_WORDS = new Set(['for', 'and', 'the', 'with', 'near', 'you', 'from']);
 const parsePositiveInt = (value, fallback, max = Number.MAX_SAFE_INTEGER) => {
     const parsed = Number.parseInt(value, 10);
     if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
@@ -141,7 +172,15 @@ const getProductSort = (sort, hasLocation) => {
         default: return hasLocation ? null : { createdAt: -1, _id: -1 };
     }
 };
-const invalidateProductCache = () => clearCacheByPrefix(PRODUCT_CACHE_PREFIX);
+const invalidateProductCache = async (productIds = []) => {
+    await clearCacheByPrefix(PRODUCT_LIST_CACHE_PREFIX);
+
+    const ids = [...new Set((Array.isArray(productIds) ? productIds : [productIds])
+        .filter(Boolean)
+        .map((productId) => String(productId)))];
+
+    await Promise.all(ids.map((productId) => deleteCacheKey(`product:${productId}`)));
+};
 
 const loadCategoryFilterIds = async (category) => {
     const normalizedCategory = clean(category);
@@ -211,19 +250,11 @@ const buildPublicProductsFilter = async (query) => {
     if (minRating) filter['ratings.average'] = { $gte: parseFloat(minRating) };
 
     if (search) {
-        const searchTerm = clean(search).slice(0, 80);
-        if (searchTerm) {
-            const safeRegex = new RegExp(escapeRegex(searchTerm), 'i');
+        const searchQuery = buildSearchQuery(search);
+        if (searchQuery) {
             filter.$and = [
                 ...(filter.$and || []),
-                {
-                    $or: [
-                        { title: safeRegex },
-                        { description: safeRegex },
-                        { tags: { $in: [safeRegex] } },
-                        { categoryName: safeRegex },
-                    ],
-                },
+                searchQuery,
             ];
         }
     }
@@ -316,18 +347,157 @@ const buildProductsListResponse = async ({
 };
 
 const buildCatalogSearch = (search) => {
-    const term = clean(search);
-    if (!term) return null;
-    const safeRegex = new RegExp(escapeRegex(term), 'i');
+    return buildSearchQuery(search);
+};
+
+const normalizeSearchInput = (value) => {
+    let normalized = clean(value).toLowerCase();
+    if (!normalized) return '';
+    normalized = normalized.replace(/[^a-z0-9\s-]/g, ' ');
+    SEARCH_PHRASE_REPLACEMENTS.forEach(([pattern, replacement]) => {
+        normalized = normalized.replace(pattern, replacement);
+    });
+    return normalized.replace(/\s+/g, ' ').trim();
+};
+
+const singularizeToken = (token) => {
+    if (token.length <= 3) return token;
+    if (token.endsWith('ies') && token.length > 4) return `${token.slice(0, -3)}y`;
+    if (token.endsWith('es') && token.length > 4) return token.slice(0, -2);
+    if (token.endsWith('s') && !token.endsWith('ss')) return token.slice(0, -1);
+    return token;
+};
+
+const getTokenVariants = (token) => {
+    const base = singularizeToken(clean(token).toLowerCase());
+    if (!base || SEARCH_STOP_WORDS.has(base)) return [];
+
+    const variants = new Set([base]);
+    Object.entries(TOKEN_SYNONYMS).forEach(([canonical, values]) => {
+        if (canonical === base || values.includes(base)) {
+            variants.add(canonical);
+            values.forEach((value) => variants.add(value));
+        }
+    });
+
+    return [...variants]
+        .map((value) => clean(value).toLowerCase())
+        .filter(Boolean);
+};
+
+const createSearchRegex = (term) => new RegExp(escapeRegex(term).replace(/\s+/g, '\\s+'), 'i');
+
+const buildSearchMetadata = (search) => {
+    const normalized = normalizeSearchInput(search).slice(0, 80);
+    if (!normalized) return null;
+
+    const phraseRegex = createSearchRegex(normalized);
+    const tokenGroups = normalized
+        .split(' ')
+        .map(getTokenVariants)
+        .filter((group) => group.length > 0)
+        .map((group) => [...new Set(group)].slice(0, 6))
+        .slice(0, 6);
+
+    if (tokenGroups.length === 0) {
+        return { normalized, phraseRegex, tokenGroups: [[normalized]] };
+    }
+
+    return { normalized, phraseRegex, tokenGroups };
+};
+
+const buildSearchFieldMatch = (variants) => {
+    const regexes = [...new Set(variants)].map(createSearchRegex);
     return {
         $or: [
-            { title: safeRegex },
-            { description: safeRegex },
-            { sku: safeRegex },
-            { categoryName: safeRegex },
-            { tags: { $in: [safeRegex] } },
+            ...regexes.map((regex) => ({ title: regex })),
+            ...regexes.map((regex) => ({ categoryName: regex })),
+            ...regexes.map((regex) => ({ tags: regex })),
+            ...regexes.map((regex) => ({ sku: regex })),
+            ...regexes.map((regex) => ({ shortDescription: regex })),
+            ...regexes.map((regex) => ({ description: regex })),
+            ...regexes.map((regex) => ({ 'attributes.key': regex })),
+            ...regexes.map((regex) => ({ 'attributes.value': regex })),
+            ...regexes.map((regex) => ({ 'variations.title': regex })),
+            ...regexes.map((regex) => ({ 'variations.sku': regex })),
         ],
     };
+};
+
+const buildSearchQuery = (search) => {
+    const meta = buildSearchMetadata(search);
+    if (!meta) return null;
+
+    const tokenClauses = meta.tokenGroups.map((group) => buildSearchFieldMatch(group));
+    return {
+        $and: [
+            ...tokenClauses,
+            {
+                $or: [
+                    { title: meta.phraseRegex },
+                    { categoryName: meta.phraseRegex },
+                    { tags: meta.phraseRegex },
+                    { shortDescription: meta.phraseRegex },
+                    { description: meta.phraseRegex },
+                    { 'attributes.value': meta.phraseRegex },
+                    { 'variations.title': meta.phraseRegex },
+                    { sku: meta.phraseRegex },
+                    ...tokenClauses,
+                ],
+            },
+        ],
+    };
+};
+
+const normalizeHaystack = (value) => normalizeSearchInput(Array.isArray(value) ? value.join(' ') : value);
+
+const scoreMatchText = (text, variants, baseBoost) => {
+    const haystack = normalizeHaystack(text);
+    if (!haystack) return 0;
+
+    let score = 0;
+    variants.forEach((variant) => {
+        const normalizedVariant = normalizeSearchInput(variant);
+        if (!normalizedVariant) return;
+        if (haystack === normalizedVariant) score = Math.max(score, baseBoost + 70);
+        else if (haystack.startsWith(normalizedVariant)) score = Math.max(score, baseBoost + 35);
+        else if (haystack.includes(normalizedVariant)) score = Math.max(score, baseBoost);
+    });
+    return score;
+};
+
+const scoreProductSearchMatch = (product, meta) => {
+    if (!product || !meta) return 0;
+
+    const phrase = meta.normalized;
+    const title = normalizeHaystack(product.title);
+    const categoryName = normalizeHaystack(product.categoryName);
+    const tags = Array.isArray(product.tags) ? product.tags : [];
+    const attributes = Array.isArray(product.attributes)
+        ? product.attributes.flatMap((attribute) => [attribute?.key, attribute?.value])
+        : [];
+    const variations = Array.isArray(product.variations)
+        ? product.variations.flatMap((variation) => [variation?.title, variation?.sku])
+        : [];
+
+    let totalScore = 0;
+    if (title === phrase) totalScore += 260;
+    else if (title.includes(phrase)) totalScore += 180;
+    if (categoryName && categoryName.includes(phrase)) totalScore += 120;
+    if (normalizeHaystack(tags).includes(phrase)) totalScore += 110;
+
+    meta.tokenGroups.forEach((variants) => {
+        totalScore += scoreMatchText(product.title, variants, SEARCH_FIELD_BOOSTS.title);
+        totalScore += scoreMatchText(product.categoryName, variants, SEARCH_FIELD_BOOSTS.categoryName);
+        totalScore += scoreMatchText(product.tags, variants, SEARCH_FIELD_BOOSTS.tags);
+        totalScore += scoreMatchText(product.sku, variants, SEARCH_FIELD_BOOSTS.sku);
+        totalScore += scoreMatchText(product.shortDescription, variants, SEARCH_FIELD_BOOSTS.shortDescription);
+        totalScore += scoreMatchText(product.description, variants, SEARCH_FIELD_BOOSTS.description);
+        totalScore += scoreMatchText(attributes, variants, SEARCH_FIELD_BOOSTS.attributes);
+        totalScore += scoreMatchText(variations, variants, SEARCH_FIELD_BOOSTS.variations);
+    });
+
+    return totalScore;
 };
 
 const getCanonicalSourceId = (product) => {
@@ -423,11 +593,14 @@ router.get('/', asyncHandler(async (req, res) => {
         minRating,
     }));
 
-    const cachedResponse = getCacheEntry(cacheKey);
+    const cachedResponse = await getCacheEntry(cacheKey);
     if (cachedResponse) {
+        console.log(`⚡ Cache HIT ${cacheKey}`);
         res.set('X-Cache', 'HIT');
         return res.json(cachedResponse);
     }
+
+    console.log(`❌ Cache MISS (DB hit) ${cacheKey}`);
 
     const baseFilter = await buildPublicProductsFilter(req.query);
     const countFilter = { ...baseFilter };
@@ -479,7 +652,7 @@ router.get('/', asyncHandler(async (req, res) => {
         customerLng,
     });
 
-    setCacheEntry(cacheKey, responseBody, PRODUCT_LIST_CACHE_TTL_SECONDS);
+    await setCacheEntry(cacheKey, responseBody, PRODUCT_CACHE_TTL_SECONDS);
     res.set('X-Cache', 'MISS');
     res.json(responseBody);
 }));
@@ -526,18 +699,10 @@ router.get('/search', asyncHandler(async (req, res) => {
     const { q, lat, lng, limit = 10 } = req.query;
     if (!q) return res.json({ success: true, products: [] });
     const limitNum = parsePositiveInt(limit, 10, 50);
-    const searchTerm = clean(q).slice(0, 80);
-    const safeRegex = new RegExp(escapeRegex(searchTerm), 'i');
-
-    const searchQuery = {
-        isActive: true, isApproved: true, stock: { $gt: 0 },
-        $or: [
-            { title: safeRegex },
-            { description: safeRegex },
-            { tags: { $in: [safeRegex] } },
-            { categoryName: safeRegex },
-        ],
-    };
+    const searchMeta = buildSearchMetadata(q);
+    if (!searchMeta) return res.json({ success: true, products: [] });
+    const searchFilter = buildSearchQuery(q);
+    const baseQuery = { isActive: true, isApproved: true, stock: { $gt: 0 } };
 
     let products;
     if (lat && lng) {
@@ -548,29 +713,37 @@ router.get('/search', asyncHandler(async (req, res) => {
                     distanceField: 'distance',
                     maxDistance: 100000,
                     spherical: true,
-                    query: { isActive: true, isApproved: true, stock: { $gt: 0 } },
+                    query: baseQuery,
                 },
             },
-            {
-                $match: {
-                    $or: [
-                        { title: safeRegex },
-                        { description: safeRegex },
-                        { tags: { $in: [safeRegex] } },
-                        { categoryName: safeRegex },
-                    ],
-                },
-            },
-            { $limit: limitNum },
+            { $match: searchFilter },
+            { $limit: Math.min(limitNum * 8, 120) },
         ]);
     } else {
-        products = await Product.find(searchQuery)
-            .select(PRODUCT_LIST_SELECT)
-            .limit(limitNum)
+        products = await Product.find({ ...baseQuery, ...searchFilter })
+            .select(PRODUCT_SEARCH_SELECT)
+            .sort({ createdAt: -1, _id: -1 })
+            .limit(Math.min(limitNum * 8, 120))
             .lean();
     }
 
-    res.json({ success: true, products });
+    const rankedProducts = products
+        .map((product) => ({
+            ...product,
+            _searchScore: scoreProductSearchMatch(product, searchMeta),
+        }))
+        .filter((product) => product._searchScore > 0)
+        .sort((a, b) => {
+            if (b._searchScore !== a._searchScore) return b._searchScore - a._searchScore;
+            if (Number.isFinite(a.distance) && Number.isFinite(b.distance) && a.distance !== b.distance) {
+                return a.distance - b.distance;
+            }
+            return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+        })
+        .slice(0, limitNum)
+        .map(({ _searchScore, ...product }) => product);
+
+    res.json({ success: true, products: rankedProducts });
 }));
 
 // GET /api/products/library — reusable catalog for vendor/admin add-to-store flow
@@ -682,6 +855,17 @@ router.get('/library/:id', protect, authorize('vendor', 'admin'), asyncHandler(a
 
 // GET /api/products/:id
 router.get('/:id', asyncHandler(async (req, res) => {
+    const cacheKey = `product:${req.params.id}`;
+    const cachedProduct = await getCacheEntry(cacheKey);
+    if (cachedProduct) {
+        console.log(`⚡ Cache HIT ${cacheKey}`);
+        res.set('X-Cache', 'HIT');
+        Product.findByIdAndUpdate(req.params.id, { $inc: { viewCount: 1 } }).catch(() => {});
+        return res.json(cachedProduct);
+    }
+
+    console.log(`❌ Cache MISS (DB hit) ${cacheKey}`);
+
     const product = await Product.findById(req.params.id)
         .populate('vendorId', 'storeName storeLogo address city ratings storeHours onVacation')
         .populate('category', 'name slug icon')
@@ -700,7 +884,11 @@ router.get('/:id', asyncHandler(async (req, res) => {
     // View count should not slow down the primary read path.
     Product.findByIdAndUpdate(req.params.id, { $inc: { viewCount: 1 } }).catch(() => {});
 
-    res.json({ success: true, product });
+    const responseBody = { success: true, product };
+    await setCacheEntry(cacheKey, responseBody, PRODUCT_CACHE_TTL_SECONDS);
+
+    res.set('X-Cache', 'MISS');
+    res.json(responseBody);
 }));
 
 // POST /api/products — vendor or admin creates product
@@ -884,7 +1072,7 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         .filter((vendor) => !duplicateVendors.has(String(vendor._id)))
         .map((vendor) => ({ _id: vendor._id, storeName: vendor.storeName }));
 
-    invalidateProductCache();
+    await invalidateProductCache(createdList.map((product) => product._id));
 
     res.status(201).json({
         success: true,
@@ -1027,7 +1215,7 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
         await Vendor.findByIdAndUpdate(targetVendor._id, { $inc: { totalProducts: 1 } });
     }
-    invalidateProductCache();
+    await invalidateProductCache(req.params.id);
     res.json({ success: true, product: updated });
 }));
 
@@ -1045,7 +1233,7 @@ router.delete('/:id', protect, authorize('vendor', 'admin'), asyncHandler(async 
 
     await product.deleteOne();
     await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
-    invalidateProductCache();
+    await invalidateProductCache(req.params.id);
     res.json({ success: true, message: 'Product deleted' });
 }));
 
@@ -1121,7 +1309,7 @@ router.post('/bulk-upload', protect, authorize('vendor', 'admin'), uploadCSV.sin
         }
     }
 
-    invalidateProductCache();
+    await invalidateProductCache([...inserted, ...updated]);
     res.json({
         success: true,
         inserted: inserted.length,
