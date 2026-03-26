@@ -46,10 +46,11 @@ const isPincodeInRanges = (pincode, ranges = []) => {
     ));
 };
 
-// Matcher: only match on exact city name or a wildcard ('*') rule.
-// Returns null if the entered city is not covered by any active rule.
+// Checkout primarily validates by pincode. City labels are still useful for
+// admins and as a fallback when a rule intentionally covers a whole city.
 const pickShippingRule = ({ city, pincode }, rules = []) => {
     const cityNormalized = normalizeCity(city);
+    const normalizedPincode = normalizePincode(pincode);
     const activeRules = rules.filter((rule) => rule?.isActive !== false);
 
     // Filter rules by city
@@ -59,15 +60,22 @@ const pickShippingRule = ({ city, pincode }, rules = []) => {
     const exactPincodeRule = cityRules.find((rule) => isPincodeInRanges(pincode, rule.pincodeRanges));
     if (exactPincodeRule) return { rule: exactPincodeRule, ranges: parsePincodeRanges(exactPincodeRule.pincodeRanges), priority: 4 };
 
-    // 2) Exact city match (general city-wide rule without pincode requirements)
+    // 2) Pincode-only match across any active rule.
+    // This keeps checkout working even when the UI only sends a pincode.
+    if (normalizedPincode) {
+        const pincodeRule = activeRules.find((rule) => isPincodeInRanges(normalizedPincode, rule.pincodeRanges));
+        if (pincodeRule) return { rule: pincodeRule, ranges: parsePincodeRanges(pincodeRule.pincodeRanges), priority: 3 };
+    }
+
+    // 3) Exact city match (general city-wide rule without pincode requirements)
     // A rule with empty pincode ranges is considered city-wide
     const cityWideRule = cityRules.find((rule) => {
         const parsed = parsePincodeRanges(rule.pincodeRanges);
         return parsed.length === 0;
     });
-    if (cityWideRule) return { rule: cityWideRule, ranges: [], priority: 3 };
+    if (cityWideRule) return { rule: cityWideRule, ranges: [], priority: 2 };
 
-    // 3) Wildcard rule — covers all cities (used in fresh DBs / open-delivery setups)
+    // 4) Wildcard rule — covers all cities (used in fresh DBs / open-delivery setups)
     const wildcardRule = activeRules.find((rule) => normalizeCity(rule.cityNormalized || rule.city) === '*');
     if (wildcardRule) return { rule: wildcardRule, ranges: parsePincodeRanges(wildcardRule.pincodeRanges), priority: 1 };
 
@@ -80,7 +88,7 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
     const matched = pickShippingRule({ city, pincode }, rules);
 
     if (!matched) {
-        // No active shipping rule covers this city — block the order.
+        const hasPincode = normalizePincode(pincode).length === 6;
         return {
             shippingCharge: 0,
             baseShippingCharge: 0,
@@ -93,7 +101,7 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
             ruleId: null,
             city: normalizeCity(city),
             pincodeRangesText: '',
-            message: 'Service is not available in this city',
+            message: hasPincode ? 'Service is not available for this pincode' : 'Service is not available in this city',
         };
     }
 
@@ -109,7 +117,7 @@ const calculateShippingQuote = ({ city, pincode, subtotal = 0, discount = 0 }, r
         isChargeApplied,
         matched: true,
         serviceAvailable: true,
-        matchingMode: matched.priority >= 4 ? 'pincode' : matched.priority >= 2 ? 'city' : 'fallback',
+        matchingMode: matched.priority >= 3 ? 'pincode' : matched.priority >= 2 ? 'city' : 'fallback',
         ruleId: matched.rule._id || null,
         city: matched.rule.city,
         pincodeRangesText: formatPincodeRanges(matched.ranges),

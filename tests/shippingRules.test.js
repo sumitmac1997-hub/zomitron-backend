@@ -38,7 +38,7 @@ describe('shipping rule utilities', () => {
         expect(freeQuote.shippingCharge).toBe(0);
     });
 
-    test('marks city as unavailable when the spelling does not match an admin rule', () => {
+    test('marks a pincode lookup as unavailable when no rule covers the entered pin', () => {
         const quote = calculateShippingQuote(
             { city: 'Varanas', pincode: '221005', subtotal: 180, discount: 0 },
             [{ _id: 'rule-1', city: 'Varanasi', cityNormalized: 'varanasi', shippingCharge: 50, freeShippingThreshold: 200 }]
@@ -48,7 +48,7 @@ describe('shipping rule utilities', () => {
             matched: false,
             serviceAvailable: false,
             shippingCharge: 0,
-            message: 'Service is not available in this city',
+            message: 'Service is not available for this pincode',
         }));
     });
 
@@ -72,6 +72,43 @@ describe('shipping rule utilities', () => {
             ruleId: 'range-rule',
             shippingCharge: 60,
             matchingMode: 'pincode',
+        }));
+    });
+
+    test('matches a pincode rule even when city is omitted', () => {
+        const quote = calculateShippingQuote(
+            { pincode: '221108', subtotal: 150, discount: 0 },
+            [
+                {
+                    _id: 'range-rule',
+                    city: 'Varanasi',
+                    cityNormalized: 'varanasi',
+                    shippingCharge: 50,
+                    freeShippingThreshold: 200,
+                    pincodeRanges: [{ start: '221108', end: '221108' }],
+                },
+            ]
+        );
+
+        expect(quote).toEqual(expect.objectContaining({
+            matched: true,
+            serviceAvailable: true,
+            ruleId: 'range-rule',
+            shippingCharge: 50,
+            matchingMode: 'pincode',
+        }));
+    });
+
+    test('returns a pincode-specific error when no rule covers the pin', () => {
+        const quote = calculateShippingQuote(
+            { pincode: '999999', subtotal: 150, discount: 0 },
+            []
+        );
+
+        expect(quote).toEqual(expect.objectContaining({
+            matched: false,
+            serviceAvailable: false,
+            message: 'Service is not available for this pincode',
         }));
     });
 });
