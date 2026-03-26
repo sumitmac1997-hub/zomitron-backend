@@ -10,12 +10,13 @@ const rateLimit = require('express-rate-limit');
 const path = require('path');
 const mongoose = require('mongoose');
 const { randomUUID } = require('crypto');
+
+dotenv.config();
+
 const { syncDefaultCategories } = require('./utils/syncDefaultCategories');
 const { initMonitoring, captureException, captureMessage } = require('./utils/monitoring');
 const { connectRedis, disconnectRedis } = require('./redis');
 
-// Load env
-dotenv.config();
 initMonitoring();
 
 const parseBoolean = (value) => ['true', '1', 'yes', 'on'].includes(String(value || '').toLowerCase());
@@ -220,7 +221,7 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = Number(process.env.PORT) || 5000;
-const HOST = process.env.HOST || '127.0.0.1';
+const HOST = process.env.HOST || '0.0.0.0';
 
 const startServer = () => {
   server.on('error', (err) => {
