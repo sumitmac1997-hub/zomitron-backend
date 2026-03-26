@@ -108,6 +108,7 @@ const productSchema = new mongoose.Schema(
             stock: { type: Number, default: 0 },
             sku: String,
             image: String,
+            isPrimaryImage: { type: Boolean, default: false },
             attributes: [{ key: String, value: String }],
         }],
         // Tax / Commission

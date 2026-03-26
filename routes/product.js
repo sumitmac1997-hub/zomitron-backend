@@ -116,6 +116,52 @@ const parseStringList = (val, splitPattern = /[,|]/) => {
 };
 
 const parseIdList = (val) => [...new Set(parseStringList(val, /,/))];
+const parseJsonArray = (value) => {
+    if (value === null || value === undefined || value === '') return [];
+    if (Array.isArray(value)) return value;
+    try {
+        const parsed = JSON.parse(value);
+        return Array.isArray(parsed) ? parsed : [];
+    } catch {
+        return [];
+    }
+};
+const orderProductImages = ({ uploadedImages = [], imageUrls = [], imageOrder = [] }) => {
+    const descriptors = [
+        ...uploadedImages.filter(Boolean).map((src, index) => ({ key: `file:${index}`, src })),
+        ...imageUrls.filter(Boolean).map((src, index) => ({ key: `url:${index}`, src })),
+    ];
+    if (descriptors.length === 0) return [];
+
+    const normalizedOrder = Array.isArray(imageOrder) ? imageOrder : [];
+    if (normalizedOrder.length === 0) return descriptors.map((item) => item.src);
+
+    const ordered = normalizedOrder
+        .map((key) => descriptors.find((item) => item.key === String(key)))
+        .filter(Boolean);
+    const orderedKeys = new Set(ordered.map((item) => item.key));
+    const remaining = descriptors.filter((item) => !orderedKeys.has(item.key));
+    return [...ordered, ...remaining].map((item) => item.src);
+};
+const applyPrimaryVariationSelection = (variations = []) => {
+    let primaryAssigned = false;
+    return variations.map((variation) => {
+        const requestedPrimary = coerceBoolean(variation?.isPrimaryImage) === true;
+        const hasImage = Boolean(variation?.image);
+        const isPrimaryImage = requestedPrimary && hasImage && !primaryAssigned;
+        if (isPrimaryImage) primaryAssigned = true;
+        return {
+            ...variation,
+            isPrimaryImage,
+        };
+    });
+};
+const promotePrimaryVariationImage = (images = [], variations = []) => {
+    const primaryVariationImage = variations.find((variation) => variation?.isPrimaryImage && variation?.image)?.image
+        || '';
+    if (!primaryVariationImage) return images;
+    return [primaryVariationImage, ...images.filter((image) => image !== primaryVariationImage)];
+};
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const SEARCH_PHRASE_REPLACEMENTS = [
@@ -936,13 +982,16 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     const canonicalSourceId = sourceProduct ? getCanonicalSourceId(sourceProduct) : null;
 
     const variationUploads = req.files?.variationImages || [];
-    let images = (req.files?.images || []).map((f) => toUploadUrl(f)).filter(Boolean) || [];
+    const uploadedImages = (req.files?.images || []).map((f) => toUploadUrl(f)).filter(Boolean);
+    const directImageUrls = parseStringList(req.body.imageUrls, /,/);
+    const imageOrder = parseJsonArray(req.body.imageOrder);
+    let images = orderProductImages({
+        uploadedImages,
+        imageUrls: directImageUrls,
+        imageOrder,
+    });
     if (images.length === 0 && variationUploads.length > 0) {
         images = variationUploads.map((f) => toUploadUrl(f)).filter(Boolean);
-    }
-    if (images.length === 0) {
-        const rawImageUrls = req.body.imageUrls;
-        images = parseStringList(rawImageUrls, /,/);
     }
     if (images.length === 0 && sourceProduct?.images?.length) {
         images = [...sourceProduct.images];
@@ -969,18 +1018,26 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     const stockValue = coerceNumber(stock);
     const weightValue = coerceNumber(weight);
     const commissionValueNum = coerceNumber(commissionValue);
-    const normalizedVariations = parsedVariations.map((variation) => ({
+    let normalizedVariations = parsedVariations.map((variation) => ({
         ...variation,
         price: coerceNumber(variation.price),
         discountPrice: coerceNumber(variation.discountPrice),
         stock: coerceNumber(variation.stock) ?? 0,
+        isPrimaryImage: coerceBoolean(variation.isPrimaryImage) === true,
     }));
+    normalizedVariations = applyPrimaryVariationSelection(normalizedVariations);
     const titleValue = title || sourceProduct?.title;
     const descriptionValue = description || sourceProduct?.description;
     const unitValue = unit || sourceProduct?.unit;
     const productTypeValue = productType || sourceProduct?.productType || 'simple';
     const externalUrlValue = externalUrl || sourceProduct?.externalUrl;
     const externalButtonTextValue = externalButtonText || sourceProduct?.externalButtonText;
+    if (productTypeValue === 'variable') {
+        if (images.length === 0) {
+            images = normalizedVariations.map((variation) => variation.image).filter(Boolean);
+        }
+        images = promotePrimaryVariationImage(images, normalizedVariations);
+    }
 
     if (!titleValue || !descriptionValue || priceValue === undefined || stockValue === undefined || !(categoryList[0] || category)) {
         return res.status(400).json({ success: false, message: 'Title, description, price, stock, and category are required' });
@@ -1143,21 +1200,22 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         delete updates.vendorId; // vendors cannot reassign product owner
     }
     // Images: prefer uploaded files, else URLs (string or array)
-    if (req.files?.images?.length > 0) {
-        updates.images = req.files.images.map((f) => toUploadUrl(f)).filter(Boolean);
+    const uploadedImages = (req.files?.images || []).map((file) => toUploadUrl(file)).filter(Boolean);
+    const imageOrder = parseJsonArray(updates.imageOrder);
+    const imageUrlList = updates.imageUrls
+        ? parseStringList(updates.imageUrls, /,/)
+        : (imageOrder.length > 0 ? (product.images || []) : []);
+    if (uploadedImages.length > 0 || imageUrlList.length > 0) {
+        updates.images = orderProductImages({
+            uploadedImages,
+            imageUrls: imageUrlList,
+            imageOrder,
+        });
     } else if (variationUploads.length > 0 && !updates.imageUrls) {
         updates.images = variationUploads.map((f) => toUploadUrl(f)).filter(Boolean);
-    } else if (updates.imageUrls) {
-        const raw = updates.imageUrls;
-        const urlList = Array.isArray(raw)
-            ? raw.map((u) => String(u).trim()).filter(Boolean)
-            : String(raw)
-                .split(',')
-                .map((u) => u.trim())
-                .filter(Boolean);
-        if (urlList.length > 0) updates.images = urlList;
     }
     delete updates.imageUrls;
+    delete updates.imageOrder;
 
     // Numeric + boolean coercions (allow zero/false)
     const priceNum = coerceNumber(updates.price);
@@ -1187,12 +1245,20 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
             price: coerceNumber(v.price),
             discountPrice: coerceNumber(v.discountPrice),
             stock: coerceNumber(v.stock) ?? 0,
+            isPrimaryImage: coerceBoolean(v.isPrimaryImage) === true,
         }));
         if (variationUploads.length > 0) {
             variationUploads.forEach((file, idx) => {
                 const url = toUploadUrl(file);
                 if (updates.variations[idx]) updates.variations[idx].image = url;
             });
+        }
+        updates.variations = applyPrimaryVariationSelection(updates.variations);
+        if ((updates.productType || product.productType) === 'variable') {
+            const fallbackImages = Array.isArray(updates.images) && updates.images.length > 0
+                ? updates.images
+                : (Array.isArray(product.images) ? product.images : []);
+            updates.images = promotePrimaryVariationImage(fallbackImages, updates.variations);
         }
     }
 
