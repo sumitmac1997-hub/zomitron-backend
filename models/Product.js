@@ -1,5 +1,13 @@
 const mongoose = require('mongoose');
 
+const slugifyProductTitle = (value) => {
+    const base = String(value || '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '');
+    return base || 'product';
+};
+
 const productSchema = new mongoose.Schema(
     {
         vendorId: {
@@ -173,10 +181,7 @@ productSchema.virtual('effectivePrice').get(function () {
 // Auto-generate slug
 productSchema.pre('save', function (next) {
     if (this.isModified('title') && !this.slug) {
-        this.slug = this.title
-            .toLowerCase()
-            .replace(/[^a-z0-9]+/g, '-')
-            .replace(/(^-|-$)/g, '') + '-' + Date.now();
+        this.slug = `${slugifyProductTitle(this.title)}-${new mongoose.Types.ObjectId().toString().slice(-8)}`;
     }
     next();
 });

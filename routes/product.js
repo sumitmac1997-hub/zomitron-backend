@@ -75,6 +75,39 @@ const parseImages = (val) => clean(val)
     .map((s) => clean(s))
     .filter(Boolean);
 
+const slugifyProductTitle = (value) => {
+    const base = clean(value)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/(^-|-$)/g, '');
+    return base || 'product';
+};
+
+const generateUniqueProductSlug = async (title, { reservedSlugs = new Set(), suffixSeed = '' } = {}) => {
+    const base = slugifyProductTitle(title);
+
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+        const suffix = [
+            suffixSeed,
+            Date.now().toString(36),
+            new mongoose.Types.ObjectId().toString().slice(-6),
+        ].filter(Boolean).join('-');
+        const candidate = `${base}-${suffix}`.replace(/-+/g, '-');
+        if (reservedSlugs.has(candidate)) continue;
+
+        // eslint-disable-next-line no-await-in-loop
+        const exists = await Product.exists({ slug: candidate });
+        if (!exists) {
+            reservedSlugs.add(candidate);
+            return candidate;
+        }
+    }
+
+    const fallback = `${base}-${new mongoose.Types.ObjectId().toString()}`;
+    reservedSlugs.add(fallback);
+    return fallback;
+};
+
 const coerceNumber = (val) => {
     if (val === null || val === undefined) return undefined;
     const num = Number(val);
@@ -149,7 +182,7 @@ const orderProductImages = ({ uploadedImages = [], imageUrls = [], imageOrder = 
 };
 const applyPrimaryVariationSelection = (variations = []) => {
     let primaryAssigned = false;
-    return variations.map((variation) => {
+    const normalized = variations.map((variation) => {
         const requestedPrimary = coerceBoolean(variation?.isPrimaryImage) === true;
         const hasImage = Boolean(variation?.image);
         const isPrimaryImage = requestedPrimary && hasImage && !primaryAssigned;
@@ -159,6 +192,15 @@ const applyPrimaryVariationSelection = (variations = []) => {
             isPrimaryImage,
         };
     });
+    if (primaryAssigned) return normalized;
+
+    const fallbackIndex = normalized.findIndex((variation) => Boolean(variation?.image));
+    if (fallbackIndex === -1) return normalized;
+
+    return normalized.map((variation, index) => ({
+        ...variation,
+        isPrimaryImage: index === fallbackIndex,
+    }));
 };
 const promotePrimaryVariationImage = (images = [], variations = []) => {
     const primaryVariationImage = variations.find((variation) => variation?.isPrimaryImage && variation?.image)?.image
@@ -990,6 +1032,7 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     const canonicalSourceId = sourceProduct ? getCanonicalSourceId(sourceProduct) : null;
 
     const variationUploads = req.files?.variationImages || [];
+    const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
     const uploadedImages = (req.files?.images || []).map((f) => toUploadUrl(f)).filter(Boolean);
     const directImageUrls = parseStringList(req.body.imageUrls, /,/);
     const imageOrder = parseJsonArray(req.body.imageOrder);
@@ -1013,7 +1056,8 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     if (Array.isArray(parsedVariations) && variationUploads.length > 0) {
         variationUploads.forEach((file, idx) => {
             const url = toUploadUrl(file);
-            if (parsedVariations[idx]) parsedVariations[idx].image = url;
+            const targetIndex = Number.isInteger(variationImageIndexes[idx]) ? variationImageIndexes[idx] : idx;
+            if (parsedVariations[targetIndex]) parsedVariations[targetIndex].image = url;
         });
     }
 
@@ -1119,7 +1163,16 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         payloads.forEach((p) => { p.categoryName = primaryCategoryName; });
     }
 
-    const createdProducts = await Product.create(payloads);
+    const reservedSlugs = new Set();
+    const payloadsWithSlugs = await Promise.all(payloads.map(async (payload, index) => ({
+        ...payload,
+        slug: await generateUniqueProductSlug(payload.title, {
+            reservedSlugs,
+            suffixSeed: `${String(payload.vendorId).slice(-6)}-${index}`,
+        }),
+    })));
+
+    const createdProducts = await Product.create(payloadsWithSlugs);
     const createdList = Array.isArray(createdProducts) ? createdProducts : [createdProducts];
 
     await Vendor.updateMany(
@@ -1196,6 +1249,7 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         if (primaryName) updates.categoryName = primaryName;
     }
     const variationUploads = req.files?.variationImages || [];
+    const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
     let targetVendor = null;
     if (req.user.role === 'admin' && updates.vendorId && updates.vendorId.toString() !== product.vendorId.toString()) {
         targetVendor = await Vendor.findById(updates.vendorId);
@@ -1258,15 +1312,20 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         if (variationUploads.length > 0) {
             variationUploads.forEach((file, idx) => {
                 const url = toUploadUrl(file);
-                if (updates.variations[idx]) updates.variations[idx].image = url;
+                const targetIndex = Number.isInteger(variationImageIndexes[idx]) ? variationImageIndexes[idx] : idx;
+                if (updates.variations[targetIndex]) updates.variations[targetIndex].image = url;
             });
         }
         updates.variations = applyPrimaryVariationSelection(updates.variations);
         if ((updates.productType || product.productType) === 'variable') {
-            const fallbackImages = Array.isArray(updates.images) && updates.images.length > 0
-                ? updates.images
-                : (Array.isArray(product.images) ? product.images : []);
-            updates.images = promotePrimaryVariationImage(fallbackImages, updates.variations);
+            const variationImages = updates.variations
+                .map((variation) => variation?.image)
+                .filter(Boolean);
+            if (variationImages.length > 0) {
+                updates.images = promotePrimaryVariationImage(variationImages, updates.variations);
+            } else {
+                updates.images = [];
+            }
         }
     }
 
