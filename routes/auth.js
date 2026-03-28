@@ -19,15 +19,34 @@ const emailSecure = process.env.SMTP_SECURE
     : emailPort === 465;
 const parseBoolean = (value) => ['true', '1', 'yes', 'on'].includes(String(value || '').toLowerCase());
 const emailIgnoreTlsErrors = parseBoolean(process.env.SMTP_IGNORE_TLS_ERRORS);
+const emailConnectionTimeoutMs = Number(process.env.SMTP_CONNECTION_TIMEOUT_MS) || 5000;
+const emailGreetingTimeoutMs = Number(process.env.SMTP_GREETING_TIMEOUT_MS) || 5000;
+const emailSocketTimeoutMs = Number(process.env.SMTP_SOCKET_TIMEOUT_MS) || 10000;
+const emailSendTimeoutMs = Number(process.env.SMTP_SEND_TIMEOUT_MS) || 8000;
 const normalizeOptionalString = (value) => {
     if (value === undefined || value === null) return undefined;
     const normalized = String(value).trim();
     return normalized ? normalized : undefined;
 };
 const normalizeEmail = (value) => normalizeOptionalString(value)?.toLowerCase();
+const withTimeout = (promise, timeoutMs, message) => new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise
+        .then((value) => {
+            clearTimeout(timer);
+            resolve(value);
+        })
+        .catch((error) => {
+            clearTimeout(timer);
+            reject(error);
+        });
+});
 const buildMailTransportOptions = () => {
     const options = {
         auth: { user: emailUser, pass: emailPass },
+        connectionTimeout: emailConnectionTimeoutMs,
+        greetingTimeout: emailGreetingTimeoutMs,
+        socketTimeout: emailSocketTimeoutMs,
     };
 
     if (emailIgnoreTlsErrors) {
@@ -86,12 +105,16 @@ const sendEmail = async (to, subject, html) => {
         throw new Error('Email transport is not configured.');
     }
 
-    await transporter.sendMail({
-        from: emailFrom,
-        to,
-        subject,
-        html,
-    });
+    await withTimeout(
+        transporter.sendMail({
+            from: emailFrom,
+            to,
+            subject,
+            html,
+        }),
+        emailSendTimeoutMs,
+        `Email sending timed out after ${emailSendTimeoutMs}ms.`
+    );
 };
 
 // POST /api/auth/register
@@ -123,24 +146,20 @@ router.post('/register', asyncHandler(async (req, res) => {
         otpExpiry: new Date(Date.now() + 10 * 60 * 1000), // 10 min
     });
 
-    let emailSent = true;
-    try {
-        await sendEmail(email, 'Verify your Zomitron account', `
+    const { accessToken, refreshToken } = generateTokens(user._id);
+    await User.findByIdAndUpdate(user._id, { refreshToken });
+
+    void sendEmail(email, 'Verify your Zomitron account', `
     <h2>Welcome to Zomitron!</h2>
     <p>Your OTP is: <strong>${otp}</strong></p>
     <p>This OTP expires in 10 minutes.</p>
-  `);
-    } catch (err) {
-        emailSent = false;
+  `).catch((err) => {
         console.error(`Registration email failed for ${email}:`, err.message);
-    }
+    });
 
-    const { accessToken, refreshToken } = generateTokens(user._id);
-    await User.findByIdAndUpdate(user._id, { refreshToken });
-    
-    // Notify admin
+    // Admin notification should never block registration response.
     const { notifyAdmin } = require('../utils/adminNotificationEngine');
-    await notifyAdmin(req.app.get('io'), {
+    void notifyAdmin(req.app.get('io'), {
         type: 'new_customer',
         message: `New user joined: ${user.name}`,
         link: '/admin/users',
@@ -149,10 +168,8 @@ router.post('/register', asyncHandler(async (req, res) => {
 
     res.status(201).json({
         success: true,
-        emailSent,
-        message: emailSent
-            ? 'Registration successful. Please verify your email.'
-            : 'Registration successful, but the verification email could not be sent right now.',
+        emailQueued: true,
+        message: 'Registration successful. Your verification email should arrive shortly.',
         token: accessToken,
         user: { _id: user._id, name: user.name, email: user.email, role: user.role, isVerified: user.isVerified },
     });

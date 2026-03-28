@@ -32,7 +32,7 @@ describe('Auth Routes', () => {
         });
         expect(res.status).toBe(201);
         expect(res.body.success).toBe(true);
-        expect(res.body.emailSent).toBe(true);
+        expect(res.body.emailQueued).toBe(true);
         expect(res.body.token).toBeDefined();
         expect(res.body.user.email).toBe('test@zomitron.com');
     });
