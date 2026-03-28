@@ -32,8 +32,22 @@ describe('Auth Routes', () => {
         });
         expect(res.status).toBe(201);
         expect(res.body.success).toBe(true);
+        expect(res.body.emailSent).toBe(true);
         expect(res.body.token).toBeDefined();
         expect(res.body.user.email).toBe('test@zomitron.com');
+    });
+
+    test('POST /api/auth/register - should allow blank optional phone', async () => {
+        const res = await request(app).post('/api/auth/register').send({
+            name: 'Phone Optional',
+            email: 'optional-phone@zomitron.com',
+            password: 'password123',
+            phone: '   ',
+            role: 'customer',
+        });
+        expect(res.status).toBe(201);
+        expect(res.body.success).toBe(true);
+        expect(res.body.user.email).toBe('optional-phone@zomitron.com');
     });
 
     test('POST /api/auth/register - should fail with duplicate email', async () => {

@@ -17,6 +17,25 @@ const emailFrom = process.env.EMAIL_FROM || process.env.SMTP_FROM || emailUser;
 const emailSecure = process.env.SMTP_SECURE
     ? ['true', '1', 'yes'].includes(String(process.env.SMTP_SECURE).toLowerCase())
     : emailPort === 465;
+const parseBoolean = (value) => ['true', '1', 'yes', 'on'].includes(String(value || '').toLowerCase());
+const emailIgnoreTlsErrors = parseBoolean(process.env.SMTP_IGNORE_TLS_ERRORS);
+const normalizeOptionalString = (value) => {
+    if (value === undefined || value === null) return undefined;
+    const normalized = String(value).trim();
+    return normalized ? normalized : undefined;
+};
+const normalizeEmail = (value) => normalizeOptionalString(value)?.toLowerCase();
+const buildMailTransportOptions = () => {
+    const options = {
+        auth: { user: emailUser, pass: emailPass },
+    };
+
+    if (emailIgnoreTlsErrors) {
+        options.tls = { rejectUnauthorized: false };
+    }
+
+    return options;
+};
 
 const createTransporter = () => {
     if (process.env.NODE_ENV === 'test') {
@@ -30,7 +49,7 @@ const createTransporter = () => {
     if (emailService) {
         return nodemailer.createTransport({
             service: emailService,
-            auth: { user: emailUser, pass: emailPass },
+            ...buildMailTransportOptions(),
         });
     }
 
@@ -39,7 +58,7 @@ const createTransporter = () => {
             host: emailHost,
             port: emailPort,
             secure: emailSecure,
-            auth: { user: emailUser, pass: emailPass },
+            ...buildMailTransportOptions(),
         });
     }
 
@@ -77,7 +96,11 @@ const sendEmail = async (to, subject, html) => {
 
 // POST /api/auth/register
 router.post('/register', asyncHandler(async (req, res) => {
-    const { name, email, password, phone, role = 'customer' } = req.body;
+    const name = normalizeOptionalString(req.body.name);
+    const email = normalizeEmail(req.body.email);
+    const password = req.body.password;
+    const phone = normalizeOptionalString(req.body.phone);
+    const role = normalizeOptionalString(req.body.role) || 'customer';
 
     if (!name || !email || !password) {
         return res.status(400).json({ success: false, message: 'Name, email and password are required' });
@@ -90,24 +113,26 @@ router.post('/register', asyncHandler(async (req, res) => {
     if (existing) return res.status(400).json({ success: false, message: 'Email already registered' });
 
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    let user;
+    const user = await User.create({
+        name,
+        email,
+        password,
+        phone,
+        role,
+        otp,
+        otpExpiry: new Date(Date.now() + 10 * 60 * 1000), // 10 min
+    });
 
+    let emailSent = true;
     try {
-        user = await User.create({
-            name, email: email.toLowerCase(), password, phone, role,
-            otp, otpExpiry: new Date(Date.now() + 10 * 60 * 1000), // 10 min
-        });
-
         await sendEmail(email, 'Verify your Zomitron account', `
     <h2>Welcome to Zomitron!</h2>
     <p>Your OTP is: <strong>${otp}</strong></p>
     <p>This OTP expires in 10 minutes.</p>
   `);
     } catch (err) {
-        if (user?._id) {
-            await User.findByIdAndDelete(user._id);
-        }
-        throw err;
+        emailSent = false;
+        console.error(`Registration email failed for ${email}:`, err.message);
     }
 
     const { accessToken, refreshToken } = generateTokens(user._id);
@@ -124,7 +149,10 @@ router.post('/register', asyncHandler(async (req, res) => {
 
     res.status(201).json({
         success: true,
-        message: 'Registration successful. Please verify your email.',
+        emailSent,
+        message: emailSent
+            ? 'Registration successful. Please verify your email.'
+            : 'Registration successful, but the verification email could not be sent right now.',
         token: accessToken,
         user: { _id: user._id, name: user.name, email: user.email, role: user.role, isVerified: user.isVerified },
     });

@@ -202,7 +202,19 @@ app.use((req, res) => {
 
 // Global Error Handler
 app.use((err, req, res, next) => {
-  if ((err.statusCode || 500) >= 500) {
+  const validationMessage = err?.name === 'ValidationError'
+    ? Object.values(err.errors || {})[0]?.message || err.message
+    : null;
+  const duplicateKeyMessage = err?.code === 11000
+    ? `${Object.keys(err.keyPattern || {})[0] || 'Field'} already exists`
+    : null;
+  const statusCode = err.statusCode
+    || (err?.name === 'ValidationError' ? 400 : undefined)
+    || (err?.code === 11000 ? 400 : undefined)
+    || 500;
+  const responseMessage = validationMessage || duplicateKeyMessage || err.message || 'Internal Server Error';
+
+  if (statusCode >= 500) {
     captureException(err, {
       requestId: req.requestId,
       method: req.method,
@@ -211,10 +223,9 @@ app.use((err, req, res, next) => {
     });
   }
   console.error(`Error [${req.requestId || 'n/a'}]:`, err.stack || err.message);
-  const statusCode = err.statusCode || 500;
   res.status(statusCode).json({
     success: false,
-    message: err.message || 'Internal Server Error',
+    message: responseMessage,
     requestId: req.requestId,
     ...(process.env.NODE_ENV === 'development' && { stack: err.stack }),
   });
