@@ -6,116 +6,13 @@ const crypto = require('crypto');
 const User = require('../models/User');
 const Vendor = require('../models/Vendor');
 const { generateTokens } = require('../middleware/auth');
-const nodemailer = require('nodemailer');
-
-const emailUser = process.env.SMTP_USER || process.env.SMTP_USERNAME || process.env.EMAIL_USER;
-const emailPass = process.env.SMTP_PASS || process.env.SMTP_PASSWORD || process.env.EMAIL_PASS;
-const emailHost = process.env.SMTP_HOST || process.env.EMAIL_HOST;
-const emailPort = Number(process.env.SMTP_PORT || process.env.EMAIL_PORT) || 587;
-const emailService = process.env.SMTP_SERVICE || process.env.EMAIL_SERVICE;
-const emailFrom = process.env.EMAIL_FROM || process.env.SMTP_FROM || emailUser;
-const emailSecure = process.env.SMTP_SECURE
-    ? ['true', '1', 'yes'].includes(String(process.env.SMTP_SECURE).toLowerCase())
-    : emailPort === 465;
-const parseBoolean = (value) => ['true', '1', 'yes', 'on'].includes(String(value || '').toLowerCase());
-const emailIgnoreTlsErrors = parseBoolean(process.env.SMTP_IGNORE_TLS_ERRORS);
-const emailConnectionTimeoutMs = Number(process.env.SMTP_CONNECTION_TIMEOUT_MS) || 5000;
-const emailGreetingTimeoutMs = Number(process.env.SMTP_GREETING_TIMEOUT_MS) || 5000;
-const emailSocketTimeoutMs = Number(process.env.SMTP_SOCKET_TIMEOUT_MS) || 10000;
-const emailSendTimeoutMs = Number(process.env.SMTP_SEND_TIMEOUT_MS) || 8000;
+const { sendEmail } = require('../utils/email');
 const normalizeOptionalString = (value) => {
     if (value === undefined || value === null) return undefined;
     const normalized = String(value).trim();
     return normalized ? normalized : undefined;
 };
 const normalizeEmail = (value) => normalizeOptionalString(value)?.toLowerCase();
-const withTimeout = (promise, timeoutMs, message) => new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-    promise
-        .then((value) => {
-            clearTimeout(timer);
-            resolve(value);
-        })
-        .catch((error) => {
-            clearTimeout(timer);
-            reject(error);
-        });
-});
-const buildMailTransportOptions = () => {
-    const options = {
-        auth: { user: emailUser, pass: emailPass },
-        connectionTimeout: emailConnectionTimeoutMs,
-        greetingTimeout: emailGreetingTimeoutMs,
-        socketTimeout: emailSocketTimeoutMs,
-    };
-
-    if (emailIgnoreTlsErrors) {
-        options.tls = { rejectUnauthorized: false };
-    }
-
-    return options;
-};
-
-const createTransporter = () => {
-    if (process.env.NODE_ENV === 'test') {
-        return nodemailer.createTransport({ jsonTransport: true });
-    }
-
-    if (!emailUser || !emailPass) {
-        return null;
-    }
-
-    if (emailService) {
-        return nodemailer.createTransport({
-            service: emailService,
-            ...buildMailTransportOptions(),
-        });
-    }
-
-    if (emailHost) {
-        return nodemailer.createTransport({
-            host: emailHost,
-            port: emailPort,
-            secure: emailSecure,
-            ...buildMailTransportOptions(),
-        });
-    }
-
-    return null;
-};
-
-const transporter = createTransporter();
-
-const assertEmailConfig = () => {
-    if (process.env.NODE_ENV === 'test') return;
-
-    if (!emailUser || !emailPass) {
-        throw new Error('Email credentials are missing. Set SMTP_USER/SMTP_PASS or EMAIL_USER/EMAIL_PASS.');
-    }
-
-    if (!emailHost && !emailService) {
-        throw new Error('Email server is missing. Set SMTP_HOST or SMTP_SERVICE in backend .env.');
-    }
-};
-
-const sendEmail = async (to, subject, html) => {
-    assertEmailConfig();
-
-    if (!transporter) {
-        throw new Error('Email transport is not configured.');
-    }
-
-    await withTimeout(
-        transporter.sendMail({
-            from: emailFrom,
-            to,
-            subject,
-            html,
-        }),
-        emailSendTimeoutMs,
-        `Email sending timed out after ${emailSendTimeoutMs}ms.`
-    );
-};
 
 // POST /api/auth/register
 router.post('/register', asyncHandler(async (req, res) => {
