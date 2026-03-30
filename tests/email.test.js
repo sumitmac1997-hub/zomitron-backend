@@ -71,16 +71,30 @@ describe('Email Utility', () => {
         }));
         expect(createTransport).toHaveBeenNthCalledWith(2, expect.objectContaining({
             host: 'smtp.hostinger.com',
-            port: 465,
-            secure: true,
+            port: 587,
+            secure: false,
             connectionTimeout: 15000,
             greetingTimeout: 15000,
             dnsTimeout: 30000,
             socketTimeout: 60000,
+            requireTLS: true,
         }));
         expect(firstTransporter.sendMail).toHaveBeenCalledTimes(1);
         expect(secondTransporter.sendMail).toHaveBeenCalledTimes(1);
         expect(secondTransporter.close).toHaveBeenCalledTimes(1);
         expect(warnSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('buildRetryConfig flips 465/SSL to 587/STARTTLS when no explicit fallback is set', () => {
+        jest.doMock('nodemailer', () => ({
+            createTransport: jest.fn(() => ({ sendMail: jest.fn(), close: jest.fn() })),
+        }));
+
+        const email = require('../utils/email');
+        const retryConfig = email.__private__.buildRetryConfig(email.__private__.buildEmailConfig());
+
+        expect(retryConfig.port).toBe(587);
+        expect(retryConfig.secure).toBe(false);
+        expect(retryConfig.requireTls).toBe(true);
     });
 });

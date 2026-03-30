@@ -27,6 +27,14 @@ const parsePositiveNumber = (value, fallback) => {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const parseOptionalPositiveNumber = (value) => {
+    if (value === undefined || value === null || String(value).trim() === '') {
+        return undefined;
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+};
+
 const withTimeout = (promise, timeoutMs, message) => new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
 
@@ -72,6 +80,10 @@ const buildEmailConfig = () => {
         ignoreTlsErrors: parseBoolean(process.env.SMTP_IGNORE_TLS_ERRORS),
         requireTls: parseBoolean(process.env.SMTP_REQUIRE_TLS),
         ignoreTls: parseBoolean(process.env.SMTP_IGNORE_TLS),
+        fallbackPort: parseOptionalPositiveNumber(process.env.SMTP_FALLBACK_PORT),
+        fallbackSecure: process.env.SMTP_FALLBACK_SECURE !== undefined
+            ? parseBoolean(process.env.SMTP_FALLBACK_SECURE)
+            : undefined,
         connectionTimeoutMs,
         greetingTimeoutMs,
         dnsTimeoutMs,
@@ -145,6 +157,13 @@ const buildMailTransportOptions = (config, overrides = {}) => {
     }
 
     return transportOptions;
+};
+
+const describeTransport = (config) => {
+    const hostLabel = config.service || config.host || 'configured SMTP';
+    const portLabel = config.port ? `:${config.port}` : '';
+    const securityLabel = config.secure ? 'secure' : 'starttls';
+    return `${hostLabel}${portLabel} (${securityLabel})`;
 };
 
 const createTransporter = (config, overrides = {}) => {
@@ -229,6 +248,39 @@ const isRetryableMailError = (error) => {
     );
 };
 
+const buildRetryConfig = (config) => {
+    const retryConfig = {
+        ...config,
+        connectionTimeoutMs: config.retryConnectionTimeoutMs,
+        greetingTimeoutMs: config.retryGreetingTimeoutMs,
+        dnsTimeoutMs: config.retryDnsTimeoutMs,
+        socketTimeoutMs: config.retrySocketTimeoutMs,
+        sendTimeoutMs: Math.max(config.retrySendTimeoutMs, config.retrySocketTimeoutMs),
+    };
+
+    if (config.service || !config.host) {
+        return retryConfig;
+    }
+
+    const fallbackPort = config.fallbackPort
+        ?? (config.port === 465 ? 587 : config.port === 587 ? 465 : undefined);
+    const fallbackSecure = config.fallbackSecure
+        ?? (fallbackPort === 465 ? true : fallbackPort === 587 ? false : config.secure);
+
+    if (!fallbackPort || fallbackPort === config.port) {
+        return retryConfig;
+    }
+
+    retryConfig.port = fallbackPort;
+    retryConfig.secure = fallbackSecure;
+
+    if (fallbackPort === 587 && config.fallbackSecure === undefined && process.env.SMTP_REQUIRE_TLS === undefined) {
+        retryConfig.requireTls = true;
+    }
+
+    return retryConfig;
+};
+
 const sendWithTimeout = (transporter, config, mailOptions) => withTimeout(
     transporter.sendMail(mailOptions),
     config.sendTimeoutMs,
@@ -258,17 +310,10 @@ const sendEmail = async (to, subject, html) => {
             throw error;
         }
 
-        const retryConfig = {
-            ...config,
-            connectionTimeoutMs: config.retryConnectionTimeoutMs,
-            greetingTimeoutMs: config.retryGreetingTimeoutMs,
-            dnsTimeoutMs: config.retryDnsTimeoutMs,
-            socketTimeoutMs: config.retrySocketTimeoutMs,
-            sendTimeoutMs: Math.max(config.retrySendTimeoutMs, config.retrySocketTimeoutMs),
-        };
+        const retryConfig = buildRetryConfig(config);
 
         console.warn(
-            `[email] SMTP send failed via ${config.service || config.host || 'configured SMTP'}${config.port ? `:${config.port}` : ''} (${error.code || error.message}). Retrying once with extended timeouts.`
+            `[email] SMTP send failed via ${describeTransport(config)} (${error.code || error.message}). Retrying once with ${describeTransport(retryConfig)}.`
         );
 
         const retryTransporter = createTransporter(retryConfig);
@@ -290,7 +335,10 @@ module.exports = {
         assertEmailConfig,
         buildEmailConfig,
         buildMailTransportOptions,
+        buildRetryConfig,
+        closeTransporter,
         createTransporter,
+        describeTransport,
         isRetryableMailError,
         resetEmailTransporterCache,
         withTimeout,
