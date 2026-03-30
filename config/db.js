@@ -99,6 +99,9 @@ const connectDB = async () => {
             categoryName: 'text',
             sku: 'text',
         }, { name: 'product_text_search' });
+        await safeCreateIndex('users', { email: 1 }, { unique: true, sparse: true, name: 'users_email_unique_idx' });
+        await safeCreateIndex('users', { mobileNumber: 1 }, { unique: true, sparse: true, name: 'users_mobile_unique_idx' });
+        await safeCreateIndex('users', { firebaseUid: 1 }, { sparse: true, name: 'users_firebase_uid_idx' });
         await safeCreateIndex('vendors', { location: '2dsphere' });
         await safeCreateIndex('pincodes', { pincode: 1 }, { unique: true });
         console.log('📍 Geospatial indexes ensured');
