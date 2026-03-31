@@ -67,6 +67,24 @@ const mergeMobileAuthProvider = (currentProvider) => {
 };
 
 const createDefaultMobileName = (mobileNumber) => `User ${mobileNumber.slice(-4)}`;
+const shouldUseProvidedMobileName = (currentName, mobileNumber) => {
+    const normalizedName = normalizeOptionalString(currentName);
+    if (!normalizedName) return true;
+    return normalizedName === createDefaultMobileName(mobileNumber);
+};
+const mergeLocalAuthProvider = (currentProvider) => {
+    switch (currentProvider) {
+    case 'mobile':
+        return 'local+mobile';
+    case 'local':
+    case 'local+mobile':
+    case 'google':
+    case 'google+mobile':
+        return currentProvider;
+    default:
+        return 'local';
+    }
+};
 
 // POST /api/auth/register
 router.post('/register', asyncHandler(async (req, res) => {
@@ -87,40 +105,51 @@ router.post('/register', asyncHandler(async (req, res) => {
         return res.status(403).json({ success: false, message: 'Cannot register as admin' });
     }
 
-    const existing = await User.findOne({
-        $or: [
-            { email },
-            { mobileNumber },
-            { phone: mobileNumber },
-        ],
-    });
-
-    if (existing?.email === email) {
+    const existingByEmail = await User.findOne({ email });
+    if (existingByEmail) {
         return res.status(400).json({ success: false, message: 'Email already registered' });
     }
 
-    if (existing && (existing.mobileNumber === mobileNumber || existing.phone === mobileNumber)) {
-        return res.status(400).json({ success: false, message: 'Mobile number already registered' });
-    }
+    let user = await findUserByMobileNumber(mobileNumber).select('+password');
+    if (user) {
+        if (!user.isActive) {
+            return res.status(403).json({ success: false, message: 'Account is deactivated' });
+        }
 
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const user = await User.create({
-        name,
-        email,
-        password,
-        mobileNumber,
-        phone: mobileNumber,
-        role,
-        authProvider: 'local',
-        otp,
-        otpExpiry: new Date(Date.now() + 10 * 60 * 1000),
-    });
+        if (user.email) {
+            return res.status(400).json({ success: false, message: 'Mobile number already registered' });
+        }
+
+        user.name = name;
+        user.email = email;
+        user.password = password;
+        user.mobileNumber = mobileNumber;
+        user.phone = mobileNumber;
+        user.role = role;
+        user.authProvider = mergeLocalAuthProvider(user.authProvider);
+        user.otp = Math.floor(100000 + Math.random() * 900000).toString();
+        user.otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
+        await user.save();
+    } else {
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        user = await User.create({
+            name,
+            email,
+            password,
+            mobileNumber,
+            phone: mobileNumber,
+            role,
+            authProvider: 'local',
+            otp,
+            otpExpiry: new Date(Date.now() + 10 * 60 * 1000),
+        });
+    }
 
     const session = await issueSession(user);
 
     void sendEmail(email, 'Verify your Zomitron account', `
     <h2>Welcome to Zomitron!</h2>
-    <p>Your OTP is: <strong>${otp}</strong></p>
+    <p>Your OTP is: <strong>${user.otp}</strong></p>
     <p>This OTP expires in 10 minutes.</p>
   `).catch((err) => {
         console.error(`Registration email failed for ${email}:`, err.message);
@@ -168,6 +197,7 @@ router.post('/login', asyncHandler(async (req, res) => {
 
 // POST /api/auth/mobile-login
 router.post('/mobile-login', asyncHandler(async (req, res) => {
+    const name = normalizeOptionalString(req.body.name);
     const mobileNumber = normalizeMobileInput(req.body.mobileNumber ?? req.body.phone);
     const firebaseIdToken = normalizeOptionalString(
         req.body.firebaseIdToken ?? req.body.idToken ?? req.body.token
@@ -223,8 +253,15 @@ router.post('/mobile-login', asyncHandler(async (req, res) => {
     let user = await findUserByMobileNumber(mobileNumber);
 
     if (!user) {
+        if (!name) {
+            return res.status(400).json({
+                success: false,
+                message: 'Name is required for first-time mobile OTP login',
+            });
+        }
+
         user = await User.create({
-            name: createDefaultMobileName(mobileNumber),
+            name,
             mobileNumber,
             phone: mobileNumber,
             authProvider: 'mobile',
@@ -241,7 +278,9 @@ router.post('/mobile-login', asyncHandler(async (req, res) => {
         user.phone = mobileNumber;
         user.firebaseUid = decodedToken.uid;
         user.authProvider = mergeMobileAuthProvider(user.authProvider);
-        if (!user.name) {
+        if (name && shouldUseProvidedMobileName(user.name, mobileNumber)) {
+            user.name = name;
+        } else if (!user.name) {
             user.name = createDefaultMobileName(mobileNumber);
         }
     }

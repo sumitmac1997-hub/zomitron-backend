@@ -107,6 +107,63 @@ describe('Auth Routes', () => {
         expect(res.body.success).toBe(false);
     });
 
+    test('POST /api/auth/register - should attach email and password to an existing mobile-only user', async () => {
+        const mobileOnlyUser = await User.create({
+            name: 'Rahul Mobile',
+            mobileNumber: '9876543250',
+            phone: '9876543250',
+            authProvider: 'mobile',
+            isVerified: true,
+        });
+
+        const res = await request(app).post('/api/auth/register').send({
+            name: 'Rahul Verma',
+            email: 'rahul.mobile@zomitron.com',
+            password: 'password123',
+            mobileNumber: '9876543250',
+        });
+
+        expect(res.status).toBe(201);
+        expect(res.body.success).toBe(true);
+        expect(res.body.user._id).toBe(String(mobileOnlyUser._id));
+        expect(res.body.user.email).toBe('rahul.mobile@zomitron.com');
+        expect(res.body.user.authProvider).toBe('local+mobile');
+
+        const user = await User.findById(mobileOnlyUser._id).select('+password');
+        expect(user.email).toBe('rahul.mobile@zomitron.com');
+        expect(user.mobileNumber).toBe('9876543250');
+        expect(user.authProvider).toBe('local+mobile');
+        expect(await user.comparePassword('password123')).toBe(true);
+    });
+
+    test('POST /api/auth/register - should still reject duplicate email even when mobile belongs to a mobile-only user', async () => {
+        await request(app).post('/api/auth/register').send({
+            name: 'Existing Email User',
+            email: 'existing-email@zomitron.com',
+            password: 'password123',
+            mobileNumber: '9876543251',
+        });
+
+        await User.create({
+            name: 'Mobile Only User',
+            mobileNumber: '9876543252',
+            phone: '9876543252',
+            authProvider: 'mobile',
+            isVerified: true,
+        });
+
+        const res = await request(app).post('/api/auth/register').send({
+            name: 'Duplicate Email Attempt',
+            email: 'existing-email@zomitron.com',
+            password: 'password123',
+            mobileNumber: '9876543252',
+        });
+
+        expect(res.status).toBe(400);
+        expect(res.body.success).toBe(false);
+        expect(res.body.message).toBe('Email already registered');
+    });
+
     test('POST /api/auth/login - should login successfully', async () => {
         await request(app).post('/api/auth/register').send({
             name: 'Login Test',
@@ -139,6 +196,7 @@ describe('Auth Routes', () => {
         });
 
         const res = await request(app).post('/api/auth/mobile-login').send({
+            name: 'Mobile New User',
             mobileNumber: '9876543215',
             firebaseUid: 'firebase-uid-new-user',
             firebaseIdToken: 'valid-token',
@@ -146,11 +204,13 @@ describe('Auth Routes', () => {
 
         expect(res.status).toBe(200);
         expect(res.body.success).toBe(true);
+        expect(res.body.user.name).toBe('Mobile New User');
         expect(res.body.user.mobileNumber).toBe('9876543215');
         expect(res.body.user.authProvider).toBe('mobile');
 
         const user = await User.findOne({ mobileNumber: '9876543215' });
         expect(user).toBeTruthy();
+        expect(user.name).toBe('Mobile New User');
         expect(user.firebaseUid).toBe('firebase-uid-new-user');
     });
 
@@ -180,6 +240,35 @@ describe('Auth Routes', () => {
         expect(res.body.success).toBe(true);
         expect(res.body.user._id).toBe(String(user._id));
         expect(res.body.user.authProvider).toBe('local+mobile');
+    });
+
+    test('POST /api/auth/mobile-login - should replace generated mobile fallback name when a real name is provided', async () => {
+        const user = await User.create({
+            name: 'User 3217',
+            mobileNumber: '9876543217',
+            phone: '9876543217',
+            authProvider: 'mobile',
+            isVerified: true,
+        });
+
+        verifyFirebaseIdToken.mockResolvedValueOnce({
+            uid: 'firebase-uid-rename',
+            phone_number: '+919876543217',
+        });
+
+        const res = await request(app).post('/api/auth/mobile-login').send({
+            name: 'Rahul Verma',
+            mobileNumber: '9876543217',
+            firebaseUid: 'firebase-uid-rename',
+            firebaseIdToken: 'valid-token-rename',
+        });
+
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.user.name).toBe('Rahul Verma');
+
+        await user.reload();
+        expect(user.name).toBe('Rahul Verma');
     });
 
     test('POST /api/auth/mobile-login - should reject mismatched verified mobile numbers', async () => {
