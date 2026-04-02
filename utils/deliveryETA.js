@@ -2,11 +2,11 @@
  * Delivery ETA and cost calculation based on straight-line distance
  * between customer and vendor coordinates.
  * Distance bands:
- *   - 0-5km:      10 minutes
- *   - 5-10km:     15 minutes
- *   - 10-50km:    45 minutes
- *   - 50-70km:    1 hour
- *   - 70-100km:   2 hours
+ *   - 0-5km:      15 minutes
+ *   - 5-10km:     25 minutes
+ *   - 10-45km:    45 minutes
+ *   - 45-70km:    1 hour
+ *   - 70-100km:   3 hours
  *   - >100km:     Same day delivery
  */
 
@@ -15,27 +15,27 @@ const getDeliveryInfo = (distanceKm) => {
 
     if (distanceKm <= 5) {
         return {
-            eta: '10 minutes',
-            etaLabel: '⚡ 10 Min Delivery',
+            eta: '15 minutes',
+            etaLabel: '⚡ 15 Min Delivery',
             etaType: 'express',
             estimatedDays: 0,
-            estimatedHours: 0.17,
+            estimatedHours: 0.25,
             deliveryCharge: 0,
-            badge: '10min',
+            badge: '15min',
             color: 'green',
         };
     } else if (distanceKm <= 10) {
         return {
-            eta: '15 minutes',
-            etaLabel: '⚡ 15 Min Delivery',
+            eta: '25 minutes',
+            etaLabel: '⚡ 25 Min Delivery',
             etaType: 'fast',
             estimatedDays: 0,
-            estimatedHours: 0.25,
+            estimatedHours: 0.42,
             deliveryCharge: 10,
-            badge: '15min',
+            badge: '25min',
             color: 'green',
         };
-    } else if (distanceKm <= 50) {
+    } else if (distanceKm <= 45) {
         return {
             eta: '45 minutes',
             etaLabel: '⚡ 45 Min Delivery',
@@ -53,19 +53,19 @@ const getDeliveryInfo = (distanceKm) => {
             etaType: 'normal',
             estimatedDays: 0,
             estimatedHours: 1,
-            deliveryCharge: Math.round(29 + (distanceKm - 50) * 0.8),
+            deliveryCharge: Math.round(29 + (distanceKm - 45) * 0.8),
             badge: '1hr',
             color: 'orange',
         };
     } else if (distanceKm <= 100) {
         return {
-            eta: '2 hours',
-            etaLabel: '🚀 2 Hr Delivery',
+            eta: '3 hours',
+            etaLabel: '🚀 3 Hr Delivery',
             etaType: 'slow',
             estimatedDays: 0,
-            estimatedHours: 2,
+            estimatedHours: 3,
             deliveryCharge: Math.round(45 + (distanceKm - 70) * 1),
-            badge: '2hr',
+            badge: '3hr',
             color: 'gray',
         };
     }

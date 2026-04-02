@@ -73,34 +73,34 @@ describe('Geo-filtering', () => {
 });
 
 describe('Delivery ETA', () => {
-    test('0-5km: 10 minute delivery', () => {
+    test('0-5km: 15 minute delivery', () => {
         const info = getDeliveryInfo(3);
-        expect(info.badge).toBe('10min');
+        expect(info.badge).toBe('15min');
         expect(info.etaType).toBe('express');
         expect(info.deliveryCharge).toBe(0);
     });
 
-    test('5-10km: 15 minute delivery', () => {
+    test('5-10km: 25 minute delivery', () => {
         const info = getDeliveryInfo(7);
-        expect(info.badge).toBe('15min');
+        expect(info.badge).toBe('25min');
         expect(info.etaType).toBe('fast');
     });
 
-    test('10-50km: 45 minute delivery', () => {
+    test('10-45km: 45 minute delivery', () => {
         const info = getDeliveryInfo(30);
         expect(info.badge).toBe('45min');
         expect(info.etaType).toBe('standard');
     });
 
-    test('50-70km: 1 hour delivery', () => {
+    test('45-70km: 1 hour delivery', () => {
         const info = getDeliveryInfo(60);
         expect(info.badge).toBe('1hr');
         expect(info.etaType).toBe('normal');
     });
 
-    test('70-100km: 2 hour delivery', () => {
+    test('70-100km: 3 hour delivery', () => {
         const info = getDeliveryInfo(80);
-        expect(info.badge).toBe('2hr');
+        expect(info.badge).toBe('3hr');
         expect(info.etaType).toBe('slow');
     });
 
