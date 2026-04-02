@@ -73,34 +73,40 @@ describe('Geo-filtering', () => {
 });
 
 describe('Delivery ETA', () => {
-    test('0-5km: 1 hour delivery', () => {
+    test('0-5km: 10 minute delivery', () => {
         const info = getDeliveryInfo(3);
-        expect(info.badge).toBe('1hr');
+        expect(info.badge).toBe('10min');
         expect(info.etaType).toBe('express');
         expect(info.deliveryCharge).toBe(0);
     });
 
-    test('5-60km: 2 hour delivery', () => {
-        const info = getDeliveryInfo(30);
-        expect(info.badge).toBe('2hr');
+    test('5-10km: 15 minute delivery', () => {
+        const info = getDeliveryInfo(7);
+        expect(info.badge).toBe('15min');
         expect(info.etaType).toBe('fast');
     });
 
-    test('60-100km: 1 day delivery', () => {
-        const info = getDeliveryInfo(80);
-        expect(info.badge).toBe('1day');
+    test('10-50km: 45 minute delivery', () => {
+        const info = getDeliveryInfo(30);
+        expect(info.badge).toBe('45min');
         expect(info.etaType).toBe('standard');
     });
 
-    test('100-500km: 2-3 days delivery', () => {
-        const info = getDeliveryInfo(200);
-        expect(info.badge).toBe('2-3days');
+    test('50-70km: 1 hour delivery', () => {
+        const info = getDeliveryInfo(60);
+        expect(info.badge).toBe('1hr');
         expect(info.etaType).toBe('normal');
     });
 
-    test('>500km: 5-7 days delivery', () => {
-        const info = getDeliveryInfo(1600);
-        expect(info.badge).toBe('5-7days');
+    test('70-100km: 2 hour delivery', () => {
+        const info = getDeliveryInfo(80);
+        expect(info.badge).toBe('2hr');
         expect(info.etaType).toBe('slow');
+    });
+
+    test('>100km: same day delivery', () => {
+        const info = getDeliveryInfo(160);
+        expect(info.badge).toBe('same-day');
+        expect(info.etaType).toBe('same_day');
     });
 });

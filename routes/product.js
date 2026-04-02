@@ -44,7 +44,7 @@ const PRODUCT_LIST_SELECT = [
     'createdAt',
     'orderCount',
 ].join(' ');
-const PRODUCT_LIST_VENDOR_SELECT = '_id storeName storeLogo ratings address isOpen approved';
+const PRODUCT_LIST_VENDOR_SELECT = '_id storeName storeLogo ratings address location isOpen approved';
 const PRODUCT_LIST_CATEGORY_SELECT = '_id name slug icon';
 const PRODUCT_SEARCH_SELECT = `${PRODUCT_LIST_SELECT} description shortDescription tags sku attributes variations`;
 
@@ -387,7 +387,9 @@ const buildProductsListResponse = async ({
             const vendor = vendorMap.get(String(product.vendorId || ''));
             if (!vendor) return null;
 
-            const coordinates = product.location?.coordinates || [];
+            const coordinates = vendor.location?.coordinates?.length === 2
+                ? vendor.location.coordinates
+                : (product.location?.coordinates || []);
             const distanceKm = Number.isFinite(customerLat) && Number.isFinite(customerLng) && coordinates.length === 2
                 ? haversineDistance(customerLat, customerLng, coordinates[1], coordinates[0])
                 : undefined;
