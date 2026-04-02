@@ -965,7 +965,7 @@ router.get('/:id', asyncHandler(async (req, res) => {
     console.log(`❌ Cache MISS (DB hit) ${cacheKey}`);
 
     const product = await Product.findById(req.params.id)
-        .populate('vendorId', 'storeName storeLogo address city ratings storeHours onVacation')
+        .populate('vendorId', 'storeName storeLogo address city ratings storeHours onVacation location isOpen')
         .populate('category', 'name slug icon')
         .populate('categories', 'name slug icon')
         .lean();
