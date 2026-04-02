@@ -24,6 +24,13 @@ const normalizeMobileInput = (value) => normalizeIndianMobileNumber(normalizeOpt
 const findUserByMobileNumber = (mobileNumber) => User.findOne({
     $or: [{ mobileNumber }, { phone: mobileNumber }],
 });
+const findUserForMobileAuth = ({ mobileNumber, firebaseUid }) => User.findOne({
+    $or: [
+        { mobileNumber },
+        { phone: mobileNumber },
+        ...(firebaseUid ? [{ firebaseUid }] : []),
+    ],
+});
 
 const buildSessionPayload = async (user) => {
     let vendorInfo = null;
@@ -250,7 +257,10 @@ router.post('/mobile-login', asyncHandler(async (req, res) => {
         });
     }
 
-    let user = await findUserByMobileNumber(mobileNumber);
+    let user = await findUserForMobileAuth({
+        mobileNumber,
+        firebaseUid: decodedToken.uid,
+    });
 
     if (!user) {
         if (!name) {
@@ -260,15 +270,30 @@ router.post('/mobile-login', asyncHandler(async (req, res) => {
             });
         }
 
-        user = await User.create({
-            name,
-            mobileNumber,
-            phone: mobileNumber,
-            authProvider: 'mobile',
-            firebaseUid: decodedToken.uid,
-            isVerified: true,
-            role: 'customer',
-        });
+        try {
+            user = await User.create({
+                name,
+                mobileNumber,
+                phone: mobileNumber,
+                authProvider: 'mobile',
+                firebaseUid: decodedToken.uid,
+                isVerified: true,
+                role: 'customer',
+            });
+        } catch (error) {
+            if (error?.code !== 11000) {
+                throw error;
+            }
+
+            user = await findUserForMobileAuth({
+                mobileNumber,
+                firebaseUid: decodedToken.uid,
+            });
+
+            if (!user) {
+                throw error;
+            }
+        }
     } else {
         if (!user.isActive) {
             return res.status(403).json({ success: false, message: 'Account is deactivated' });
