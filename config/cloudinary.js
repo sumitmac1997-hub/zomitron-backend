@@ -1,3 +1,22 @@
+const stripWrappedQuotes = (value) => {
+    const normalized = String(value ?? '').trim();
+    if (!normalized) return '';
+
+    const startsWithQuote = normalized.startsWith('"') || normalized.startsWith("'");
+    const endsWithQuote = normalized.endsWith('"') || normalized.endsWith("'");
+    if (startsWithQuote && endsWithQuote && normalized.length >= 2) {
+        return normalized.slice(1, -1).trim();
+    }
+
+    return normalized;
+};
+
+['CLOUDINARY_URL', 'CLOUDINARY_ACCOUNT_URL', 'CLOUDINARY_API_PROXY'].forEach((key) => {
+    if (process.env[key] !== undefined) {
+        process.env[key] = stripWrappedQuotes(process.env[key]);
+    }
+});
+
 const cloudinary = require('cloudinary').v2;
 const { CloudinaryStorage } = require('multer-storage-cloudinary');
 const multer = require('multer');
@@ -20,9 +39,21 @@ const PRODUCT_IMAGE_TRANSFORMATION = {
     fetch_format: 'auto',
 };
 
+const cleanEnvValue = (value) => {
+    return stripWrappedQuotes(value);
+};
+
+const readFirstEnv = (...keys) => {
+    for (const key of keys) {
+        const value = cleanEnvValue(process.env[key]);
+        if (value) return value;
+    }
+    return '';
+};
+
 const isRealValue = (value) => {
     if (!value) return false;
-    const normalized = String(value).trim().toLowerCase();
+    const normalized = cleanEnvValue(value).toLowerCase();
     if (!normalized) return false;
     if (normalized.includes('your_') || normalized.includes('your-')) return false;
     if (normalized.includes('placeholder')) return false;
@@ -31,7 +62,7 @@ const isRealValue = (value) => {
 };
 
 const parseCloudinaryUrl = (value) => {
-    const normalized = String(value || '').trim();
+    const normalized = cleanEnvValue(value);
     if (!normalized) return null;
 
     try {
@@ -48,16 +79,28 @@ const parseCloudinaryUrl = (value) => {
     }
 };
 
-const cloudinaryUrlConfig = parseCloudinaryUrl(process.env.CLOUDINARY_URL);
-const cloudinaryCloudName = isRealValue(process.env.CLOUDINARY_CLOUD_NAME)
-    ? process.env.CLOUDINARY_CLOUD_NAME
-    : cloudinaryUrlConfig?.cloudName;
-const cloudinaryApiKey = isRealValue(process.env.CLOUDINARY_API_KEY)
-    ? process.env.CLOUDINARY_API_KEY
-    : cloudinaryUrlConfig?.apiKey;
-const cloudinaryApiSecret = isRealValue(process.env.CLOUDINARY_API_SECRET)
-    ? process.env.CLOUDINARY_API_SECRET
-    : cloudinaryUrlConfig?.apiSecret;
+const normalizedCloudinaryUrl = readFirstEnv('CLOUDINARY_URL', 'CLOUDINARY_IMAGE_URL', 'CLOUDINARY_URI');
+if (normalizedCloudinaryUrl) {
+    process.env.CLOUDINARY_URL = normalizedCloudinaryUrl;
+}
+
+let detectedCloudinaryConfig = {};
+try {
+    detectedCloudinaryConfig = cloudinary.config(true) || {};
+} catch (error) {
+    detectedCloudinaryConfig = {};
+}
+
+const cloudinaryUrlConfig = parseCloudinaryUrl(normalizedCloudinaryUrl);
+const cloudinaryCloudName = isRealValue(readFirstEnv('CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_NAME', 'CLOUD_NAME'))
+    ? readFirstEnv('CLOUDINARY_CLOUD_NAME', 'CLOUDINARY_NAME', 'CLOUD_NAME')
+    : (cloudinaryUrlConfig?.cloudName || cleanEnvValue(detectedCloudinaryConfig.cloud_name));
+const cloudinaryApiKey = isRealValue(readFirstEnv('CLOUDINARY_API_KEY', 'CLOUDINARY_KEY', 'API_KEY'))
+    ? readFirstEnv('CLOUDINARY_API_KEY', 'CLOUDINARY_KEY', 'API_KEY')
+    : (cloudinaryUrlConfig?.apiKey || cleanEnvValue(detectedCloudinaryConfig.api_key));
+const cloudinaryApiSecret = isRealValue(readFirstEnv('CLOUDINARY_API_SECRET', 'CLOUDINARY_SECRET', 'API_SECRET'))
+    ? readFirstEnv('CLOUDINARY_API_SECRET', 'CLOUDINARY_SECRET', 'API_SECRET')
+    : (cloudinaryUrlConfig?.apiSecret || cleanEnvValue(detectedCloudinaryConfig.api_secret));
 
 const hasCloudinaryConfig = isRealValue(cloudinaryCloudName)
     && isRealValue(cloudinaryApiKey)

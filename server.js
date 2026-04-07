@@ -16,6 +16,7 @@ dotenv.config();
 const { syncDefaultCategories } = require('./utils/syncDefaultCategories');
 const { initMonitoring, captureException, captureMessage } = require('./utils/monitoring');
 const { connectRedis, disconnectRedis } = require('./redis');
+const { hasCloudinaryConfig } = require('./config/cloudinary');
 
 initMonitoring();
 
@@ -177,6 +178,9 @@ app.get('/health', (req, res) => {
     service: 'Zomitron API',
     uptimeSeconds: Math.round(process.uptime()),
     mongoState: mongoose.connection.readyState,
+    uploads: {
+      cloudinaryConfigured: hasCloudinaryConfig,
+    },
   });
 });
 
@@ -250,6 +254,7 @@ const startServer = () => {
 
   server.listen(PORT, HOST, () => {
     console.log(`🚀 Zomitron API running on http://${HOST}:${PORT} in ${process.env.NODE_ENV || 'development'} mode`);
+    console.log(hasCloudinaryConfig ? '🖼️ Cloudinary uploads enabled' : '⚠️ Cloudinary uploads disabled: product image saves will fail until Cloudinary env vars are loaded');
   });
 };
 

@@ -166,6 +166,19 @@ const parseStringList = (val, splitPattern = /[,|]/) => {
         .filter(Boolean);
 };
 
+const parseImageUrlList = (val) => {
+    if (val === null || val === undefined) return [];
+    if (Array.isArray(val)) {
+        return val
+            .map((item) => clean(item))
+            .filter(Boolean);
+    }
+    return String(val)
+        .split(/\r?\n|,/)
+        .map((item) => clean(item))
+        .filter(Boolean);
+};
+
 const parseIdList = (val) => [...new Set(parseStringList(val, /,/))];
 const parseJsonArray = (value) => {
     if (value === null || value === undefined || value === '') return [];
@@ -1213,7 +1226,7 @@ router.post('/', protect, authorize('vendor', 'admin'), parseProductImageUpload,
     const galleryFiles = req.files?.images || [];
     const variationFiles = req.files?.variationImages || [];
     const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
-    const galleryUrls = filterLegacyLocalProductUrls(parseStringList(req.body.imageUrls, /,/));
+    const galleryUrls = filterLegacyLocalProductUrls(parseImageUrlList(req.body.imageUrls));
     const imageOrder = parseJsonArray(req.body.imageOrder);
 
     let parsedVariations = variations
@@ -1528,7 +1541,7 @@ router.put('/:id', protect, authorize('vendor', 'admin'), parseProductImageUploa
     const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
     const imageOrder = parseJsonArray(updates.imageOrder);
     const submittedGalleryUrls = updates.imageUrls !== undefined
-        ? filterLegacyLocalProductUrls(parseStringList(updates.imageUrls, /,/))
+        ? filterLegacyLocalProductUrls(parseImageUrlList(updates.imageUrls))
         : normalizedSourceGallery.images;
     const shouldRebuildMedia = galleryFiles.length > 0
         || variationFiles.length > 0
