@@ -751,6 +751,7 @@ const mapCsvRowToProduct = async (row, vendor) => {
     const city = clean(row.city || row.City) || vendor.city;
     const state = clean(row.state || row.State) || vendor.state;
     const productId = clean(row.productId || row['Product ID'] || row.ProductId || row.id || row.ID || row._id || row['﻿ID']);
+    const weightNum = normalizeNumber(row.weight || row.Weight);
 
     if (!title || Number.isNaN(price)) {
         return { error: 'Missing required fields (title/price)' };
@@ -776,7 +777,7 @@ const mapCsvRowToProduct = async (row, vendor) => {
             tags,
             sku,
             unit: clean(row.unit || row.Unit || row['Weight unit']) || 'piece',
-            weight: normalizeNumber(row.weight || row.Weight),
+            weight: Number.isNaN(weightNum) ? undefined : weightNum,
             isApproved: true,
         },
         productId,
