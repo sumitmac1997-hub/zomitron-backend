@@ -4,6 +4,7 @@ jest.mock('../models/Product', () => ({
     findById: jest.fn(),
     create: jest.fn(),
     findByIdAndUpdate: jest.fn(),
+    exists: jest.fn(),
 }));
 
 jest.mock('../models/Vendor', () => ({
@@ -11,6 +12,7 @@ jest.mock('../models/Vendor', () => ({
     find: jest.fn(),
     updateMany: jest.fn(),
     findByIdAndUpdate: jest.fn(),
+    findById: jest.fn(),
 }));
 
 jest.mock('../models/Category', () => ({
@@ -35,10 +37,40 @@ jest.mock('../middleware/auth', () => ({
     },
 }));
 
+jest.mock('../middleware/productUpload', () => ({
+    MAX_PRODUCT_IMAGE_COUNT: 5,
+    parseProductImageUpload: (req, res, next) => next(),
+}));
+
 jest.mock('../config/cloudinary', () => ({
-    uploadProduct: {
-        fields: () => (req, res, next) => next(),
+    createImageAsset: (source) => {
+        if (!source) return null;
+        if (typeof source === 'string') {
+            return { url: source, publicId: '', provider: 'external', resourceType: 'image' };
+        }
+        const url = source.deliveryUrl || source.url || source.secure_url || source.path || source.originalname || 'upload-url';
+        return {
+            url,
+            publicId: source.public_id || source.publicId || '',
+            provider: source.public_id ? 'cloudinary' : 'external',
+            resourceType: source.resource_type || 'image',
+        };
     },
+    createSignedUploadSignature: () => ({
+        timestamp: 1712490000,
+        signature: 'signed-payload',
+        apiKey: 'cloud-key',
+        cloudName: 'cloud-name',
+    }),
+    deleteStoredImageAsset: jest.fn().mockResolvedValue(null),
+    uploadBufferImage: jest.fn(async ({ publicIdPrefix }) => ({
+        public_id: `products/mock/${publicIdPrefix}`,
+        secure_url: `https://cdn.example/${publicIdPrefix}.jpg`,
+        deliveryUrl: `https://cdn.example/${publicIdPrefix}.jpg`,
+        resource_type: 'image',
+        bytes: 1024,
+        format: 'jpg',
+    })),
     uploadCSV: {
         single: () => (req, res, next) => next(),
     },
@@ -149,6 +181,7 @@ const invokeRoute = async ({ path, method, headers = {}, query = {}, body = {}, 
 describe('Product library and clone routes', () => {
     beforeEach(() => {
         jest.clearAllMocks();
+        Product.exists.mockResolvedValue(false);
     });
 
     test('GET /api/products/library applies vendor/category filters and marks already-added items', async () => {
@@ -181,9 +214,9 @@ describe('Product library and clone routes', () => {
             isApproved: true,
             vendorId: 'vendor-other',
         }));
-        expect(Product.countDocuments.mock.calls[0][0].$and).toEqual([
+        expect(Product.countDocuments.mock.calls[0][0].$and).toEqual(expect.arrayContaining([
             { $or: [{ category: 'cat-1' }, { categories: 'cat-1' }] },
-        ]);
+        ]));
         expect(res.body.products[0]).toEqual(expect.objectContaining({
             canonicalSourceId: 'catalog-root',
             alreadyAdded: true,
@@ -236,6 +269,7 @@ describe('Product library and clone routes', () => {
                 title: 'Catalog Phone',
                 description: 'Catalog description',
                 images: ['/catalog-phone.jpg'],
+                imageAssets: [{ url: '/catalog-phone.jpg', publicId: '', provider: 'external' }],
                 unit: 'piece',
                 productType: 'simple',
             }),
@@ -279,6 +313,25 @@ describe('Product library and clone routes', () => {
             skippedVendorIds: ['vendor-b'],
             assignedVendors: [{ _id: 'vendor-a', storeName: 'Store A' }],
             skippedVendors: [{ _id: 'vendor-b', storeName: 'Store B' }],
+        }));
+    });
+
+    test('POST /api/products/uploads/signature returns a vendor-scoped signed upload payload', async () => {
+        Vendor.findById.mockReturnValueOnce(makeSelectChain({ _id: 'vendor-a' }));
+
+        const res = await invokeRoute({
+            path: '/uploads/signature',
+            method: 'post',
+            headers: { 'x-role': 'admin' },
+            body: { vendorId: 'vendor-a' },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.upload).toEqual(expect.objectContaining({
+            folder: 'products/vendor-a',
+            signature: 'signed-payload',
+            apiKey: 'cloud-key',
+            cloudName: 'cloud-name',
         }));
     });
 });

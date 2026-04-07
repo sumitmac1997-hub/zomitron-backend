@@ -8,10 +8,24 @@ const Category = require('../models/Category');
 const TaxClass = require('../models/TaxClass');
 const User = require('../models/User');
 const { protect, authorize } = require('../middleware/auth');
+const { parseProductImageUpload } = require('../middleware/productUpload');
 const { haversineDistance } = require('../utils/haversine');
 const { getDeliveryInfo } = require('../utils/deliveryETA');
 const { buildCacheKey, clearCacheByPrefix, deleteCacheKey, getCacheEntry, setCacheEntry } = require('../utils/cache');
-const { uploadProduct, uploadCSV, toUploadUrl } = require('../config/cloudinary');
+const { createSignedUploadSignature, uploadCSV } = require('../config/cloudinary');
+const {
+    MAX_PRODUCT_IMAGE_COUNT,
+    assignVariationImageAssets,
+    buildProductImageFolder,
+    buildVariableProductGallery,
+    cloneVariation,
+    collectImageAssetsToDelete,
+    collectProductImageAssets,
+    deleteImageAssetBatch,
+    orderProductAssets,
+    resolveSubmittedAssetsFromUrls,
+    uploadProductFileBatch,
+} = require('../utils/productImages');
 const csv = require('csv-parser');
 const { Readable } = require('stream');
 
@@ -163,23 +177,6 @@ const parseJsonArray = (value) => {
         return [];
     }
 };
-const orderProductImages = ({ uploadedImages = [], imageUrls = [], imageOrder = [] }) => {
-    const descriptors = [
-        ...uploadedImages.filter(Boolean).map((src, index) => ({ key: `file:${index}`, src })),
-        ...imageUrls.filter(Boolean).map((src, index) => ({ key: `url:${index}`, src })),
-    ];
-    if (descriptors.length === 0) return [];
-
-    const normalizedOrder = Array.isArray(imageOrder) ? imageOrder : [];
-    if (normalizedOrder.length === 0) return descriptors.map((item) => item.src);
-
-    const ordered = normalizedOrder
-        .map((key) => descriptors.find((item) => item.key === String(key)))
-        .filter(Boolean);
-    const orderedKeys = new Set(ordered.map((item) => item.key));
-    const remaining = descriptors.filter((item) => !orderedKeys.has(item.key));
-    return [...ordered, ...remaining].map((item) => item.src);
-};
 const applyPrimaryVariationSelection = (variations = []) => {
     let primaryAssigned = false;
     const normalized = variations.map((variation) => {
@@ -202,11 +199,119 @@ const applyPrimaryVariationSelection = (variations = []) => {
         isPrimaryImage: index === fallbackIndex,
     }));
 };
-const promotePrimaryVariationImage = (images = [], variations = []) => {
-    const primaryVariationImage = variations.find((variation) => variation?.isPrimaryImage && variation?.image)?.image
-        || '';
-    if (!primaryVariationImage) return images;
-    return [primaryVariationImage, ...images.filter((image) => image !== primaryVariationImage)];
+
+const buildProductMediaState = async ({
+    vendorId,
+    productType,
+    galleryFiles = [],
+    galleryUrls = [],
+    imageOrder = [],
+    baseImageAssets = [],
+    variations = [],
+    variationFiles = [],
+    variationImageIndexes = [],
+    existingVariationAssets = [],
+    context = {},
+}) => {
+    if (productType !== 'variable' && galleryFiles.length + galleryUrls.length > MAX_PRODUCT_IMAGE_COUNT) {
+        throw new Error(`You can upload up to ${MAX_PRODUCT_IMAGE_COUNT} product gallery images.`);
+    }
+
+    const galleryUploadedAssets = productType === 'variable'
+        ? []
+        : await uploadProductFileBatch({
+            files: galleryFiles,
+            vendorId,
+            publicIdPrefix: 'gallery',
+            context,
+        });
+
+    const variationUploadedAssets = variationFiles.length > 0
+        ? await uploadProductFileBatch({
+            files: variationFiles,
+            vendorId,
+            publicIdPrefix: 'variation',
+            context,
+        })
+        : [];
+
+    const nextVariations = assignVariationImageAssets({
+        variations,
+        uploadedAssets: variationUploadedAssets,
+        variationImageIndexes,
+        existingVariationAssets,
+    });
+
+    const imageAssets = productType === 'variable'
+        ? buildVariableProductGallery(nextVariations)
+        : orderProductAssets({
+            uploadedAssets: galleryUploadedAssets,
+            existingAssets: resolveSubmittedAssetsFromUrls(galleryUrls, baseImageAssets),
+            imageOrder,
+        });
+
+    return {
+        imageAssets,
+        images: imageAssets.map((asset) => asset.url),
+        variations: nextVariations,
+        uploadedAssets: [...galleryUploadedAssets, ...variationUploadedAssets],
+    };
+};
+
+const normalizeVariationPayloads = (variations = []) => applyPrimaryVariationSelection(
+    (Array.isArray(variations) ? variations : []).map((variation) => ({
+        ...cloneVariation(variation),
+        price: coerceNumber(variation.price),
+        discountPrice: coerceNumber(variation.discountPrice),
+        stock: coerceNumber(variation.stock) ?? 0,
+        isPrimaryImage: coerceBoolean(variation.isPrimaryImage) === true,
+    })),
+);
+
+const resolveTargetVendors = async ({ user, body }) => {
+    if (user.role === 'vendor') {
+        const vendor = await Vendor.findOne({ userId: user._id, approved: true });
+        if (!vendor) {
+            throw createHttpError(403, 'Vendor not approved or not found');
+        }
+        return [vendor];
+    }
+
+    const requestedVendorIds = parseIdList(body.vendorIds);
+    const fallbackVendorId = clean(body.vendorId || body.vendor);
+    const vendorIds = requestedVendorIds.length > 0
+        ? requestedVendorIds
+        : (fallbackVendorId ? [fallbackVendorId] : []);
+
+    if (vendorIds.length === 0) {
+        throw createHttpError(400, 'Select at least one vendor for this product');
+    }
+
+    const vendors = await Vendor.find({ _id: { $in: vendorIds } });
+    if (vendors.length !== vendorIds.length) {
+        throw createHttpError(404, 'One or more vendors were not found');
+    }
+
+    return vendors;
+};
+
+const normalizeProductImages = (product) => {
+    const imageAssets = collectProductImageAssets({
+        imageAssets: product?.imageAssets,
+        images: product?.images,
+        variations: [],
+    }).slice(0, MAX_PRODUCT_IMAGE_COUNT);
+
+    return {
+        imageAssets,
+        images: imageAssets.map((asset) => asset.url),
+    };
+};
+
+const createHttpError = (statusCode, message) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
 };
 
 const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -951,6 +1056,52 @@ router.get('/library/:id', protect, authorize('vendor', 'admin'), asyncHandler(a
     });
 }));
 
+// POST /api/products/uploads/signature — future direct signed Cloudinary uploads
+router.post('/uploads/signature', protect, authorize('vendor', 'admin'), asyncHandler(async (req, res) => {
+    let targetVendor = null;
+
+    if (req.user.role === 'vendor') {
+        targetVendor = await Vendor.findOne({ userId: req.user._id, approved: true }).select('_id');
+        if (!targetVendor) {
+            return res.status(403).json({ success: false, message: 'Vendor not approved or not found' });
+        }
+    } else {
+        const vendorId = clean(req.body.vendorId || req.body.vendor);
+        if (!vendorId) {
+            return res.status(400).json({ success: false, message: 'vendorId is required for signed uploads' });
+        }
+        targetVendor = await Vendor.findById(vendorId).select('_id');
+        if (!targetVendor) {
+            return res.status(404).json({ success: false, message: 'Vendor not found' });
+        }
+    }
+
+    const folder = buildProductImageFolder(targetVendor._id);
+    const timestamp = Math.floor(Date.now() / 1000);
+    const transformation = 'c_limit,h_1600,q_auto:good,w_1600';
+    let signaturePayload = null;
+    try {
+        signaturePayload = createSignedUploadSignature({
+            folder,
+            timestamp,
+            transformation,
+        });
+    } catch (error) {
+        return res.status(503).json({ success: false, message: error.message });
+    }
+
+    res.json({
+        success: true,
+        upload: {
+            ...signaturePayload,
+            folder,
+            transformation,
+            maxFileSizeBytes: 2 * 1024 * 1024,
+            allowedFormats: ['jpg', 'jpeg', 'png', 'webp'],
+        },
+    });
+}));
+
 // GET /api/products/:id
 router.get('/:id', asyncHandler(async (req, res) => {
     const cacheKey = `product:${req.params.id}`;
@@ -990,37 +1141,42 @@ router.get('/:id', asyncHandler(async (req, res) => {
 }));
 
 // POST /api/products — vendor or admin creates product
-router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
-    { name: 'images', maxCount: 10 },
-    { name: 'variationImages', maxCount: 30 },
-]), asyncHandler(async (req, res) => {
+router.post('/', protect, authorize('vendor', 'admin'), parseProductImageUpload, asyncHandler(async (req, res) => {
     let targetVendors = [];
-    if (req.user.role === 'vendor') {
-        const vendor = await Vendor.findOne({ userId: req.user._id, approved: true });
-        if (!vendor) return res.status(403).json({ success: false, message: 'Vendor not approved or not found' });
-        targetVendors = [vendor];
-    } else {
-        const requestedVendorIds = parseIdList(req.body.vendorIds);
-        const fallbackVendorId = clean(req.body.vendorId || req.body.vendor);
-        const vendorIds = requestedVendorIds.length > 0
-            ? requestedVendorIds
-            : (fallbackVendorId ? [fallbackVendorId] : []);
-
-        if (vendorIds.length === 0) {
-            return res.status(400).json({ success: false, message: 'Select at least one vendor for this product' });
-        }
-
-        targetVendors = await Vendor.find({ _id: { $in: vendorIds } });
-        if (targetVendors.length !== vendorIds.length) {
-            return res.status(404).json({ success: false, message: 'One or more vendors were not found' });
-        }
+    try {
+        targetVendors = await resolveTargetVendors({ user: req.user, body: req.body });
+    } catch (error) {
+        return res.status(error.statusCode || 400).json({ success: false, message: error.message });
     }
 
-    const { title, description, price, discountPrice, category, subCategory, stock, pincode, tags, sku, unit, weight,
-        manageStock, allowBackorders, soldIndividually, taxStatus, taxClass, commissionMode, commissionValue, attributes,
-        productType, externalUrl, externalButtonText, variations } = req.body;
-    const categoriesRaw = req.body.categories;
-    const categoryList = parseIdList(categoriesRaw);
+    const {
+        title,
+        description,
+        price,
+        discountPrice,
+        category,
+        subCategory,
+        stock,
+        pincode,
+        tags,
+        sku,
+        unit,
+        weight,
+        manageStock,
+        allowBackorders,
+        soldIndividually,
+        taxStatus,
+        taxClass,
+        commissionMode,
+        commissionValue,
+        attributes,
+        productType,
+        externalUrl,
+        externalButtonText,
+        variations,
+    } = req.body;
+
+    const categoryList = parseIdList(req.body.categories);
     const sourceProductId = clean(req.body.sourceProductId);
     let sourceProduct = null;
 
@@ -1031,76 +1187,63 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         }
     }
 
+    const sourceGallery = normalizeProductImages(sourceProduct);
+    const sourceVariations = Array.isArray(sourceProduct?.variations)
+        ? sourceProduct.variations.map((variation) => cloneVariation(variation))
+        : [];
     const canonicalSourceId = sourceProduct ? getCanonicalSourceId(sourceProduct) : null;
 
-    const variationUploads = req.files?.variationImages || [];
+    const galleryFiles = req.files?.images || [];
+    const variationFiles = req.files?.variationImages || [];
     const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
-    const uploadedImages = (req.files?.images || []).map((f) => toUploadUrl(f)).filter(Boolean);
-    const directImageUrls = parseStringList(req.body.imageUrls, /,/);
+    const galleryUrls = parseStringList(req.body.imageUrls, /,/);
     const imageOrder = parseJsonArray(req.body.imageOrder);
-    let images = orderProductImages({
-        uploadedImages,
-        imageUrls: directImageUrls,
-        imageOrder,
-    });
-    if (images.length === 0 && variationUploads.length > 0) {
-        images = variationUploads.map((f) => toUploadUrl(f)).filter(Boolean);
-    }
-    if (images.length === 0 && sourceProduct?.images?.length) {
-        images = [...sourceProduct.images];
-    }
 
-    if (images.length === 0) {
-        return res.status(400).json({ success: false, message: 'Add at least one image (upload file or paste image URL).' });
-    }
-
-    const parsedVariations = variations ? (typeof variations === 'string' ? JSON.parse(variations) : variations) : [];
-    if (Array.isArray(parsedVariations) && variationUploads.length > 0) {
-        variationUploads.forEach((file, idx) => {
-            const url = toUploadUrl(file);
-            const targetIndex = Number.isInteger(variationImageIndexes[idx]) ? variationImageIndexes[idx] : idx;
-            if (parsedVariations[targetIndex]) parsedVariations[targetIndex].image = url;
-        });
-    }
+    let parsedVariations = variations
+        ? (typeof variations === 'string' ? JSON.parse(variations) : variations)
+        : sourceVariations;
+    let normalizedVariations = normalizeVariationPayloads(parsedVariations);
 
     const parsedAttributes = attributes
         ? (typeof attributes === 'string' ? JSON.parse(attributes) : attributes)
-        : undefined;
-    const parsedTags = parseStringList(tags, /,/);
-    const priceValue = coerceNumber(price);
-    const discountValue = coerceNumber(discountPrice);
-    const stockValue = coerceNumber(stock);
-    const weightValue = coerceNumber(weight);
-    const commissionValueNum = coerceNumber(commissionValue);
-    let normalizedVariations = parsedVariations.map((variation) => ({
-        ...variation,
-        price: coerceNumber(variation.price),
-        discountPrice: coerceNumber(variation.discountPrice),
-        stock: coerceNumber(variation.stock) ?? 0,
-        isPrimaryImage: coerceBoolean(variation.isPrimaryImage) === true,
-    }));
-    normalizedVariations = applyPrimaryVariationSelection(normalizedVariations);
+        : sourceProduct?.attributes;
+    const parsedTags = tags !== undefined
+        ? parseStringList(tags, /,/)
+        : (Array.isArray(sourceProduct?.tags) ? sourceProduct.tags : []);
+
     const titleValue = title || sourceProduct?.title;
     const descriptionValue = description || sourceProduct?.description;
-    const unitValue = unit || sourceProduct?.unit;
+    const priceValue = coerceNumber(price ?? sourceProduct?.price);
+    const discountValue = coerceNumber(discountPrice ?? sourceProduct?.discountPrice);
+    const stockValue = coerceNumber(stock ?? sourceProduct?.stock);
+    const weightValue = coerceNumber(weight ?? sourceProduct?.weight);
+    const commissionValueNum = coerceNumber(commissionValue ?? sourceProduct?.commissionValue);
+    const unitValue = unit || sourceProduct?.unit || 'piece';
     const productTypeValue = productType || sourceProduct?.productType || 'simple';
     const externalUrlValue = externalUrl || sourceProduct?.externalUrl;
     const externalButtonTextValue = externalButtonText || sourceProduct?.externalButtonText;
-    if (productTypeValue === 'variable') {
-        if (images.length === 0) {
-            images = normalizedVariations.map((variation) => variation.image).filter(Boolean);
-        }
-        images = promotePrimaryVariationImage(images, normalizedVariations);
+    const primaryCategoryId = categoryList[0] || category || sourceProduct?.category;
+
+    if (!titleValue || !descriptionValue || priceValue === undefined || stockValue === undefined || !primaryCategoryId) {
+        return res.status(400).json({
+            success: false,
+            message: 'Title, description, price, stock, and category are required',
+        });
     }
 
-    if (!titleValue || !descriptionValue || priceValue === undefined || stockValue === undefined || !(categoryList[0] || category)) {
-        return res.status(400).json({ success: false, message: 'Title, description, price, stock, and category are required' });
+    if (discountValue !== undefined && priceValue !== undefined && discountValue >= priceValue) {
+        return res.status(400).json({
+            success: false,
+            message: 'Discount price must be less than original price',
+        });
     }
 
-    const taxClassCode = (taxClass || 'standard').toString().toLowerCase();
+    const taxClassCode = (taxClass || sourceProduct?.taxClass || 'standard').toString().toLowerCase();
     if (!['standard', 'zero'].includes(taxClassCode)) {
         const tax = await TaxClass.findOne({ code: taxClassCode, isActive: true });
-        if (!tax) return res.status(400).json({ success: false, message: 'Invalid tax class selected' });
+        if (!tax) {
+            return res.status(400).json({ success: false, message: 'Invalid tax class selected' });
+        }
     }
 
     const duplicateVendors = new Set();
@@ -1112,73 +1255,124 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
                 { sourceProductId: canonicalSourceId },
             ],
         }).select('vendorId').lean();
-        existingAssignments.forEach((product) => duplicateVendors.add(String(product.vendorId)));
+        existingAssignments.forEach((productDoc) => duplicateVendors.add(String(productDoc.vendorId)));
     }
 
-    const payloads = targetVendors
-        .filter((vendor) => !duplicateVendors.has(String(vendor._id)))
-        .map((vendor) => ({
-            vendorId: vendor._id,
-            sourceProductId: canonicalSourceId || undefined,
-            title: titleValue,
-            description: descriptionValue,
-            price: priceValue,
-            discountPrice: discountValue,
-            images,
-            category: categoryList[0] || category,
-            categories: categoryList.length ? categoryList : undefined,
-            subCategory,
-            stock: stockValue,
-            location: vendor.location,
-            pincode: pincode || vendor.pincode,
-            city: vendor.city || vendor.address?.city,
-            state: vendor.state || vendor.address?.state,
-            tags: parsedTags,
-            sku,
-            unit: unitValue,
-            weight: weightValue,
-            manageStock: manageStock !== undefined ? manageStock === 'true' || manageStock === true : true,
-            allowBackorders: allowBackorders === 'true' || allowBackorders === true,
-            soldIndividually: soldIndividually === 'true' || soldIndividually === true,
-            taxStatus: taxStatus || 'taxable',
-            taxClass: taxClassCode,
-            commissionMode: commissionMode || undefined,
-            commissionValue: commissionValueNum,
-            attributes: parsedAttributes,
-            productType: productTypeValue,
-            externalUrl: externalUrlValue,
-            externalButtonText: externalButtonTextValue,
-            variations: normalizedVariations,
-        }));
-
-    if (payloads.length === 0) {
+    const vendorsToCreate = targetVendors.filter((vendor) => !duplicateVendors.has(String(vendor._id)));
+    if (vendorsToCreate.length === 0) {
         return res.status(409).json({
             success: false,
             message: 'This product is already assigned to the selected vendor(s)',
         });
     }
 
-    // Resolve categoryName for primary category (first in list or single)
-    const primaryCategoryId = categoryList[0] || category;
     const primaryCategoryName = await resolveCategoryName(primaryCategoryId);
-    if (primaryCategoryName) {
-        payloads.forEach((p) => { p.categoryName = primaryCategoryName; });
+    const reservedSlugs = new Set();
+    const uploadedAssetsToCleanup = [];
+
+    let payloadsWithSlugs = [];
+    try {
+        payloadsWithSlugs = await Promise.all(vendorsToCreate.map(async (vendor, index) => {
+            const mediaState = await buildProductMediaState({
+                vendorId: vendor._id,
+                productType: productTypeValue,
+                galleryFiles,
+                galleryUrls: galleryUrls.length > 0 ? galleryUrls : sourceGallery.images,
+                imageOrder,
+                baseImageAssets: sourceGallery.imageAssets,
+                variations: normalizedVariations,
+                variationFiles,
+                variationImageIndexes,
+                existingVariationAssets: sourceVariations,
+                context: {
+                    vendorId: String(vendor._id),
+                    source: 'product-create',
+                },
+            });
+
+            uploadedAssetsToCleanup.push(...mediaState.uploadedAssets);
+
+            let finalImageAssets = mediaState.imageAssets;
+            if (productTypeValue !== 'variable' && finalImageAssets.length === 0) {
+                finalImageAssets = sourceGallery.imageAssets;
+            }
+            if (productTypeValue === 'variable' && finalImageAssets.length === 0) {
+                finalImageAssets = buildVariableProductGallery(mediaState.variations);
+                if (finalImageAssets.length === 0) {
+                    finalImageAssets = sourceGallery.imageAssets;
+                }
+            }
+
+            if (finalImageAssets.length === 0) {
+                throw createHttpError(400, 'Add at least one image (upload file or paste image URL).');
+            }
+
+            const effectiveStock = productTypeValue === 'variable'
+                ? mediaState.variations.reduce((sum, variation) => sum + (variation.stock || 0), 0)
+                : stockValue;
+
+            return {
+                vendorId: vendor._id,
+                sourceProductId: canonicalSourceId || undefined,
+                title: titleValue,
+                description: descriptionValue,
+                price: priceValue,
+                discountPrice: discountValue,
+                images: finalImageAssets.map((asset) => asset.url),
+                imageAssets: finalImageAssets,
+                category: primaryCategoryId,
+                categories: categoryList.length ? categoryList : undefined,
+                categoryName: primaryCategoryName,
+                subCategory,
+                stock: effectiveStock,
+                location: vendor.location,
+                pincode: pincode || sourceProduct?.pincode || vendor.pincode,
+                city: vendor.city || vendor.address?.city,
+                state: vendor.state || vendor.address?.state,
+                tags: parsedTags,
+                sku: sku || sourceProduct?.sku,
+                unit: unitValue,
+                weight: weightValue,
+                manageStock: manageStock !== undefined
+                    ? coerceBoolean(manageStock)
+                    : (sourceProduct?.manageStock ?? true),
+                allowBackorders: allowBackorders !== undefined
+                    ? coerceBoolean(allowBackorders)
+                    : (sourceProduct?.allowBackorders ?? false),
+                soldIndividually: soldIndividually !== undefined
+                    ? coerceBoolean(soldIndividually)
+                    : (sourceProduct?.soldIndividually ?? false),
+                taxStatus: taxStatus || sourceProduct?.taxStatus || 'taxable',
+                taxClass: taxClassCode,
+                commissionMode: commissionMode || sourceProduct?.commissionMode || undefined,
+                commissionValue: commissionValueNum,
+                attributes: parsedAttributes,
+                productType: productTypeValue,
+                externalUrl: externalUrlValue,
+                externalButtonText: externalButtonTextValue,
+                variations: mediaState.variations,
+                slug: await generateUniqueProductSlug(titleValue, {
+                    reservedSlugs,
+                    suffixSeed: `${String(vendor._id).slice(-6)}-${index}`,
+                }),
+            };
+        }));
+    } catch (error) {
+        await deleteImageAssetBatch(uploadedAssetsToCleanup);
+        return res.status(error.statusCode || 400).json({ success: false, message: error.message });
     }
 
-    const reservedSlugs = new Set();
-    const payloadsWithSlugs = await Promise.all(payloads.map(async (payload, index) => ({
-        ...payload,
-        slug: await generateUniqueProductSlug(payload.title, {
-            reservedSlugs,
-            suffixSeed: `${String(payload.vendorId).slice(-6)}-${index}`,
-        }),
-    })));
-
-    const createdProducts = await Product.create(payloadsWithSlugs);
+    let createdProducts = [];
+    try {
+        createdProducts = await Product.create(payloadsWithSlugs);
+    } catch (error) {
+        await deleteImageAssetBatch(uploadedAssetsToCleanup);
+        throw error;
+    }
     const createdList = Array.isArray(createdProducts) ? createdProducts : [createdProducts];
 
     await Vendor.updateMany(
-        { _id: { $in: createdList.map((product) => product.vendorId) } },
+        { _id: { $in: createdList.map((productDoc) => productDoc.vendorId) } },
         { $inc: { totalProducts: 1 } },
     );
 
@@ -1188,11 +1382,12 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     const skippedVendors = targetVendors
         .filter((vendor) => duplicateVendors.has(String(vendor._id)))
         .map((vendor) => ({ _id: vendor._id, storeName: vendor.storeName }));
-    const assignedVendors = targetVendors
-        .filter((vendor) => !duplicateVendors.has(String(vendor._id)))
-        .map((vendor) => ({ _id: vendor._id, storeName: vendor.storeName }));
+    const assignedVendors = vendorsToCreate.map((vendor) => ({
+        _id: vendor._id,
+        storeName: vendor.storeName,
+    }));
 
-    await invalidateProductCache(createdList.map((product) => product._id));
+    await invalidateProductCache(createdList.map((productDoc) => productDoc._id));
 
     res.status(201).json({
         success: true,
@@ -1209,10 +1404,7 @@ router.post('/', protect, authorize('vendor', 'admin'), uploadProduct.fields([
 }));
 
 // PUT /api/products/:id — vendor edits product
-router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
-    { name: 'images', maxCount: 10 },
-    { name: 'variationImages', maxCount: 30 },
-]), asyncHandler(async (req, res) => {
+router.put('/:id', protect, authorize('vendor', 'admin'), parseProductImageUpload, asyncHandler(async (req, res) => {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
 
@@ -1223,21 +1415,30 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         }
     }
 
+    const previousProductSnapshot = product.toObject();
     const updates = { ...req.body };
+    const sourceGallery = normalizeProductImages(product);
+    const existingVariations = Array.isArray(product.variations)
+        ? product.variations.map((variation) => cloneVariation(variation.toObject ? variation.toObject() : variation))
+        : [];
+
     if (updates.taxClass) {
         updates.taxClass = String(updates.taxClass).trim().toLowerCase();
         if (!['standard', 'zero'].includes(updates.taxClass)) {
             const tax = await TaxClass.findOne({ code: updates.taxClass, isActive: true });
-            if (!tax) return res.status(400).json({ success: false, message: 'Invalid tax class selected' });
+            if (!tax) {
+                return res.status(400).json({ success: false, message: 'Invalid tax class selected' });
+            }
         }
     }
+
     const categoriesRaw = updates.categories;
     if (categoriesRaw !== undefined) {
         const categoryList = Array.isArray(categoriesRaw)
             ? categoriesRaw.filter(Boolean)
             : String(categoriesRaw || '')
                 .split(',')
-                .map((c) => c.trim())
+                .map((item) => item.trim())
                 .filter(Boolean);
         updates.categories = categoryList;
         if (categoryList.length > 0) {
@@ -1250,38 +1451,21 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
         const primaryName = await resolveCategoryName(updates.category);
         if (primaryName) updates.categoryName = primaryName;
     }
-    const variationUploads = req.files?.variationImages || [];
-    const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
+
     let targetVendor = null;
     if (req.user.role === 'admin' && updates.vendorId && updates.vendorId.toString() !== product.vendorId.toString()) {
         targetVendor = await Vendor.findById(updates.vendorId);
-        if (!targetVendor) return res.status(404).json({ success: false, message: 'New vendor not found' });
+        if (!targetVendor) {
+            return res.status(404).json({ success: false, message: 'New vendor not found' });
+        }
         updates.location = targetVendor.location;
         updates.pincode = targetVendor.pincode;
         updates.city = targetVendor.city;
         updates.state = targetVendor.state;
     } else {
-        delete updates.vendorId; // vendors cannot reassign product owner
+        delete updates.vendorId;
     }
-    // Images: prefer uploaded files, else URLs (string or array)
-    const uploadedImages = (req.files?.images || []).map((file) => toUploadUrl(file)).filter(Boolean);
-    const imageOrder = parseJsonArray(updates.imageOrder);
-    const imageUrlList = updates.imageUrls
-        ? parseStringList(updates.imageUrls, /,/)
-        : (imageOrder.length > 0 ? (product.images || []) : []);
-    if (uploadedImages.length > 0 || imageUrlList.length > 0) {
-        updates.images = orderProductImages({
-            uploadedImages,
-            imageUrls: imageUrlList,
-            imageOrder,
-        });
-    } else if (variationUploads.length > 0 && !updates.imageUrls) {
-        updates.images = variationUploads.map((f) => toUploadUrl(f)).filter(Boolean);
-    }
-    delete updates.imageUrls;
-    delete updates.imageOrder;
 
-    // Numeric + boolean coercions (allow zero/false)
     const priceNum = coerceNumber(updates.price);
     if (priceNum !== undefined) updates.price = priceNum;
     const discountNum = coerceNumber(updates.discountPrice);
@@ -1300,56 +1484,128 @@ router.put('/:id', protect, authorize('vendor', 'admin'), uploadProduct.fields([
     const soldIndividuallyBool = coerceBoolean(updates.soldIndividually);
     if (soldIndividuallyBool !== undefined) updates.soldIndividually = soldIndividuallyBool;
 
-    if (updates.attributes && typeof updates.attributes === 'string') updates.attributes = JSON.parse(updates.attributes);
-    if (updates.productType) updates.productType = updates.productType;
-    if (updates.variations && typeof updates.variations === 'string') updates.variations = JSON.parse(updates.variations);
-    if (Array.isArray(updates.variations)) {
-        updates.variations = updates.variations.map((v) => ({
-            ...v,
-            price: coerceNumber(v.price),
-            discountPrice: coerceNumber(v.discountPrice),
-            stock: coerceNumber(v.stock) ?? 0,
-            isPrimaryImage: coerceBoolean(v.isPrimaryImage) === true,
-        }));
-        if (variationUploads.length > 0) {
-            variationUploads.forEach((file, idx) => {
-                const url = toUploadUrl(file);
-                const targetIndex = Number.isInteger(variationImageIndexes[idx]) ? variationImageIndexes[idx] : idx;
-                if (updates.variations[targetIndex]) updates.variations[targetIndex].image = url;
-            });
-        }
-        updates.variations = applyPrimaryVariationSelection(updates.variations);
-        if ((updates.productType || product.productType) === 'variable') {
-            const variationImages = updates.variations
-                .map((variation) => variation?.image)
-                .filter(Boolean);
-            if (variationImages.length > 0) {
-                updates.images = promotePrimaryVariationImage(variationImages, updates.variations);
-            } else {
-                updates.images = [];
-            }
-        }
+    if (updates.attributes && typeof updates.attributes === 'string') {
+        updates.attributes = JSON.parse(updates.attributes);
+    }
+    if (updates.tags !== undefined) {
+        updates.tags = parseStringList(updates.tags, /,/);
+    }
+    if (updates.variations && typeof updates.variations === 'string') {
+        updates.variations = JSON.parse(updates.variations);
     }
 
-    // Business validation: discount must be below price (use existing price if not provided)
+    const effectiveProductType = updates.productType || product.productType || 'simple';
+    let normalizedVariationUpdates = updates.variations !== undefined
+        ? normalizeVariationPayloads(updates.variations)
+        : normalizeVariationPayloads(existingVariations);
+    if (effectiveProductType !== 'variable' && updates.productType && updates.productType !== 'variable') {
+        normalizedVariationUpdates = [];
+    }
+
+    const galleryFiles = req.files?.images || [];
+    const variationFiles = req.files?.variationImages || [];
+    const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
+    const imageOrder = parseJsonArray(updates.imageOrder);
+    const submittedGalleryUrls = updates.imageUrls !== undefined
+        ? parseStringList(updates.imageUrls, /,/)
+        : sourceGallery.images;
+    const shouldRebuildMedia = galleryFiles.length > 0
+        || variationFiles.length > 0
+        || updates.imageUrls !== undefined
+        || updates.imageOrder !== undefined
+        || updates.variations !== undefined
+        || updates.productType !== undefined;
+
+    const uploadedAssetsToCleanup = [];
+
+    try {
+        if (shouldRebuildMedia) {
+            const mediaState = await buildProductMediaState({
+                vendorId: targetVendor?._id || product.vendorId,
+                productType: effectiveProductType,
+                galleryFiles,
+                galleryUrls: submittedGalleryUrls,
+                imageOrder,
+                baseImageAssets: sourceGallery.imageAssets,
+                variations: normalizedVariationUpdates,
+                variationFiles,
+                variationImageIndexes,
+                existingVariationAssets: existingVariations,
+                context: {
+                    vendorId: String(targetVendor?._id || product.vendorId),
+                    productId: String(product._id),
+                    source: 'product-update',
+                },
+            });
+
+            uploadedAssetsToCleanup.push(...mediaState.uploadedAssets);
+
+            let finalImageAssets = mediaState.imageAssets;
+            if (effectiveProductType === 'variable' && finalImageAssets.length === 0) {
+                finalImageAssets = buildVariableProductGallery(mediaState.variations);
+                if (finalImageAssets.length === 0) {
+                    finalImageAssets = sourceGallery.imageAssets;
+                }
+            }
+
+            if (finalImageAssets.length === 0) {
+                throw createHttpError(400, 'Add at least one image (upload file or paste image URL).');
+            }
+
+            updates.imageAssets = finalImageAssets;
+            updates.images = finalImageAssets.map((asset) => asset.url);
+            updates.variations = mediaState.variations;
+        } else if (updates.variations !== undefined) {
+            updates.variations = normalizedVariationUpdates;
+        }
+    } catch (error) {
+        await deleteImageAssetBatch(uploadedAssetsToCleanup);
+        return res.status(error.statusCode || 400).json({ success: false, message: error.message });
+    }
+
+    delete updates.imageUrls;
+    delete updates.imageOrder;
+
+    if (effectiveProductType === 'variable') {
+        const effectiveVariations = Array.isArray(updates.variations) ? updates.variations : existingVariations;
+        updates.stock = effectiveVariations.reduce((sum, variation) => sum + (variation.stock || 0), 0);
+    }
+
     const effectivePrice = updates.price !== undefined ? updates.price : product.price;
     const effectiveDiscount = updates.discountPrice !== undefined ? updates.discountPrice : product.discountPrice;
     if (effectiveDiscount !== undefined && effectivePrice !== undefined && effectiveDiscount >= effectivePrice) {
+        await deleteImageAssetBatch(uploadedAssetsToCleanup);
         return res.status(400).json({
             success: false,
             message: 'Discount price must be less than original price',
         });
     }
 
-    const updated = await Product.findByIdAndUpdate(
-        req.params.id,
-        updates,
-        { new: true, runValidators: true, context: 'query' },
-    );
+    let updated = null;
+    try {
+        updated = await Product.findByIdAndUpdate(
+            req.params.id,
+            updates,
+            { new: true, runValidators: true, context: 'query' },
+        );
+    } catch (error) {
+        await deleteImageAssetBatch(uploadedAssetsToCleanup);
+        throw error;
+    }
+
     if (targetVendor) {
         await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
         await Vendor.findByIdAndUpdate(targetVendor._id, { $inc: { totalProducts: 1 } });
     }
+
+    const cleanupFailures = await deleteImageAssetBatch(collectImageAssetsToDelete({
+        previousProduct: previousProductSnapshot,
+        nextProduct: updated,
+    }));
+    if (cleanupFailures.length > 0) {
+        console.error('Failed to clean up some product images after update', cleanupFailures);
+    }
+
     await invalidateProductCache(req.params.id);
     res.json({ success: true, product: updated });
 }));
@@ -1368,6 +1624,12 @@ router.delete('/:id', protect, authorize('vendor', 'admin'), asyncHandler(async 
 
     await product.deleteOne();
     await Vendor.findByIdAndUpdate(product.vendorId, { $inc: { totalProducts: -1 } });
+
+    const cleanupFailures = await deleteImageAssetBatch(collectProductImageAssets(product));
+    if (cleanupFailures.length > 0) {
+        console.error('Failed to clean up some product images after delete', cleanupFailures);
+    }
+
     await invalidateProductCache(req.params.id);
     res.json({ success: true, message: 'Product deleted' });
 }));

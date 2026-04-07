@@ -8,6 +8,35 @@ const slugifyProductTitle = (value) => {
     return base || 'product';
 };
 
+const imageAssetSchema = new mongoose.Schema(
+    {
+        url: {
+            type: String,
+            required: true,
+            trim: true,
+        },
+        publicId: {
+            type: String,
+            default: '',
+            trim: true,
+        },
+        provider: {
+            type: String,
+            enum: ['cloudinary', 'external', 'local'],
+            default: 'cloudinary',
+        },
+        resourceType: {
+            type: String,
+            default: 'image',
+        },
+        width: Number,
+        height: Number,
+        bytes: Number,
+        format: String,
+    },
+    { _id: false },
+);
+
 const productSchema = new mongoose.Schema(
     {
         vendorId: {
@@ -57,8 +86,16 @@ const productSchema = new mongoose.Schema(
             type: [String],
             required: [true, 'At least one image is required'],
             validate: {
-                validator: (v) => v.length >= 1 && v.length <= 10,
-                message: 'Product must have 1-10 images',
+                validator: (v) => v.length >= 1 && v.length <= 5,
+                message: 'Product must have 1-5 images',
+            },
+        },
+        imageAssets: {
+            type: [imageAssetSchema],
+            default: [],
+            validate: {
+                validator: (value) => Array.isArray(value) && value.length <= 5,
+                message: 'Product cannot store more than 5 image assets',
             },
         },
         category: {
@@ -116,6 +153,7 @@ const productSchema = new mongoose.Schema(
             stock: { type: Number, default: 0 },
             sku: String,
             image: String,
+            imageAsset: imageAssetSchema,
             isPrimaryImage: { type: Boolean, default: false },
             attributes: [{ key: String, value: String }],
         }],
@@ -176,6 +214,27 @@ productSchema.virtual('discountPercent').get(function () {
 // Virtual: effective price
 productSchema.virtual('effectivePrice').get(function () {
     return this.discountPrice || this.price;
+});
+
+productSchema.pre('validate', function (next) {
+    if (Array.isArray(this.imageAssets) && this.imageAssets.length > 0) {
+        this.images = this.imageAssets
+            .map((asset) => asset?.url)
+            .filter(Boolean)
+            .slice(0, 5);
+    }
+
+    if (Array.isArray(this.variations)) {
+        this.variations = this.variations.map((variation) => {
+            if (variation?.image || !variation?.imageAsset?.url) return variation;
+            return {
+                ...variation,
+                image: variation.imageAsset.url,
+            };
+        });
+    }
+
+    next();
 });
 
 // Auto-generate slug
