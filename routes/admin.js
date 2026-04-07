@@ -16,6 +16,8 @@ const { uploadVendor, toUploadUrl } = require('../config/cloudinary');
 const { buildInvoicePdf } = require('../utils/pdfInvoice');
 const { normalizeCity, parsePincodeRanges, serializeShippingRule } = require('../utils/shippingRules');
 
+const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // All admin routes require auth + admin role
 router.use(protect, authorize('admin'));
 
@@ -171,31 +173,97 @@ router.put('/vendors/:id/commission', asyncHandler(async (req, res) => {
 
 // GET /api/admin/orders
 router.get('/orders', asyncHandler(async (req, res) => {
-    const { page = 1, limit = 20, status, vendorId, from, to, search } = req.query;
-    const query = {};
-    if (status) query.orderStatus = status;
-    if (vendorId) query.vendorIds = vendorId;
+    const { page = 1, limit = 20, status, vendorId, from, to, search, storeSearch } = req.query;
+    const andConditions = [];
+
+    if (status) andConditions.push({ orderStatus: status });
+    if (vendorId) andConditions.push({ vendorIds: vendorId });
+
     if (from || to) {
-        query.createdAt = {};
-        if (from) query.createdAt.$gte = new Date(from);
-        if (to) query.createdAt.$lte = new Date(to);
+        const createdAt = {};
+        if (from) createdAt.$gte = new Date(from);
+        if (to) createdAt.$lte = new Date(to);
+        andConditions.push({ createdAt });
     }
     if (search) {
         const term = search.trim();
-        query.orderNumber = { $regex: term, $options: 'i' };
+        andConditions.push({ orderNumber: { $regex: escapeRegex(term), $options: 'i' } });
+    }
+
+    const storeSearchTerm = String(storeSearch || '').trim();
+    if (storeSearchTerm) {
+        const storeRegex = new RegExp(escapeRegex(storeSearchTerm), 'i');
+
+        const [matchingVendors, matchingCategories] = await Promise.all([
+            Vendor.aggregate([
+                {
+                    $project: {
+                        _id: 1,
+                        storeName: 1,
+                        idStr: { $toString: '$_id' },
+                    },
+                },
+                {
+                    $match: {
+                        $or: [
+                            { storeName: storeRegex },
+                            { idStr: storeRegex },
+                        ],
+                    },
+                },
+                { $limit: 100 },
+            ]),
+            Category.find({
+                $or: [
+                    { name: storeRegex },
+                    { slug: storeRegex },
+                ],
+            }).select('_id').lean(),
+        ]);
+
+        const categoryIds = matchingCategories.map((category) => category._id);
+        const productCategoryFilters = [
+            { categoryName: storeRegex },
+            ...(categoryIds.length ? [
+                { category: { $in: categoryIds } },
+                { categories: { $in: categoryIds } },
+            ] : []),
+        ];
+
+        const matchingProductIds = productCategoryFilters.length > 0
+            ? await Product.distinct('_id', { $or: productCategoryFilters })
+            : [];
+
+        const matchingVendorIds = [...new Set(matchingVendors.map((vendor) => vendor._id))];
+        const storeSearchFilters = [];
+
+        if (matchingVendorIds.length > 0) {
+            storeSearchFilters.push({ vendorIds: { $in: matchingVendorIds } });
+        }
+        if (matchingProductIds.length > 0) {
+            storeSearchFilters.push({ 'items.productId': { $in: matchingProductIds } });
+        }
+
+        if (storeSearchFilters.length === 0) {
+            return res.json({ success: true, orders: [], total: 0, page: parseInt(page), pages: 0 });
+        }
+
+        andConditions.push({ $or: storeSearchFilters });
     }
 
     const limitNum = Math.min(parseInt(limit), 100);
+    const pageNum = parseInt(page);
+    const query = andConditions.length ? { $and: andConditions } : {};
     const total = await Order.countDocuments(query);
     const orders = await Order.find(query)
         .populate('customerId', 'name email')
         .populate('vendorIds', 'storeName')
         .sort({ createdAt: -1 })
-        .skip((parseInt(page) - 1) * parseInt(limit))
+        .skip((pageNum - 1) * limitNum)
         .limit(limitNum)
         .lean();
 
-    res.json({ success: true, orders, total, page: parseInt(page), pages: Math.ceil(total / limitNum) });
+    res.json({ success: true, orders, total, page: pageNum, pages: Math.ceil(total / limitNum) });
 }));
 
 // GET /api/admin/orders/:id/invoice — PDF invoice
