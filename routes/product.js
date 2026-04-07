@@ -742,7 +742,7 @@ const mapCsvRowToProduct = async (row, vendor) => {
     const stockRaw = row.stock || row.Stock || row['Stock'] || row['Quantity'];
     const stockNum = normalizeNumber(stockRaw);
     const stock = Number.isNaN(stockNum) ? 0 : parseInt(stockNum);
-    const tags = clean(row.tags || row.Tags).split(',').map((t) => clean(t)).filter(Boolean);
+    const tags = clean(row.tags || row.Tags).split(/[,|]/).map((t) => clean(t)).filter(Boolean);
     const sku = clean(row.sku || row.SKU);
     const categoryRaw = clean(row.category || row.Category || row.Categories?.split(',')?.[0]);
     const category = await ensureCategory(categoryRaw || 'General');
@@ -750,7 +750,7 @@ const mapCsvRowToProduct = async (row, vendor) => {
     const pincode = clean(row.pincode || row.Pincode || row['Postal Code']) || vendor.pincode;
     const city = clean(row.city || row.City) || vendor.city;
     const state = clean(row.state || row.State) || vendor.state;
-    const productId = clean(row.productId || row.id || row.ID || row._id || row['﻿ID']);
+    const productId = clean(row.productId || row['Product ID'] || row.ProductId || row.id || row.ID || row._id || row['﻿ID']);
 
     if (!title || Number.isNaN(price)) {
         return { error: 'Missing required fields (title/price)' };
