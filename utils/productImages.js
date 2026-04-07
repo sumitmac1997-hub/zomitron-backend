@@ -183,6 +183,7 @@ const uploadProductFileBatch = async ({
             publicIdPrefix: `${publicIdPrefix}-${index + 1}`,
             mimetype: file.mimetype,
             context,
+            requireCloudinary: true,
         });
 
         return createImageAsset(uploadResult);

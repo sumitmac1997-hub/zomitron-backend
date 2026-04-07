@@ -308,6 +308,19 @@ const normalizeProductImages = (product) => {
     };
 };
 
+const isLegacyLocalProductImageUrl = (value) => {
+    const normalized = String(value || '').trim().replace(/^https?:\/\/[^/]+/i, '');
+    return /^\/uploads\/products\//i.test(normalized);
+};
+
+const filterLegacyLocalProductUrls = (urls = []) => (Array.isArray(urls) ? urls : [])
+    .map((url) => String(url || '').trim())
+    .filter(Boolean)
+    .filter((url) => !isLegacyLocalProductImageUrl(url));
+
+const filterLegacyLocalProductAssets = (assets = []) => (Array.isArray(assets) ? assets : [])
+    .filter((asset) => asset?.url && !isLegacyLocalProductImageUrl(asset.url));
+
 const createHttpError = (statusCode, message) => {
     const error = new Error(message);
     error.statusCode = statusCode;
@@ -1188,6 +1201,10 @@ router.post('/', protect, authorize('vendor', 'admin'), parseProductImageUpload,
     }
 
     const sourceGallery = normalizeProductImages(sourceProduct);
+    const normalizedSourceGallery = {
+        imageAssets: filterLegacyLocalProductAssets(sourceGallery.imageAssets),
+        images: filterLegacyLocalProductUrls(sourceGallery.images),
+    };
     const sourceVariations = Array.isArray(sourceProduct?.variations)
         ? sourceProduct.variations.map((variation) => cloneVariation(variation))
         : [];
@@ -1196,7 +1213,7 @@ router.post('/', protect, authorize('vendor', 'admin'), parseProductImageUpload,
     const galleryFiles = req.files?.images || [];
     const variationFiles = req.files?.variationImages || [];
     const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
-    const galleryUrls = parseStringList(req.body.imageUrls, /,/);
+    const galleryUrls = filterLegacyLocalProductUrls(parseStringList(req.body.imageUrls, /,/));
     const imageOrder = parseJsonArray(req.body.imageOrder);
 
     let parsedVariations = variations
@@ -1277,9 +1294,9 @@ router.post('/', protect, authorize('vendor', 'admin'), parseProductImageUpload,
                 vendorId: vendor._id,
                 productType: productTypeValue,
                 galleryFiles,
-                galleryUrls: galleryUrls.length > 0 ? galleryUrls : sourceGallery.images,
+                galleryUrls: galleryUrls.length > 0 ? galleryUrls : normalizedSourceGallery.images,
                 imageOrder,
-                baseImageAssets: sourceGallery.imageAssets,
+                baseImageAssets: normalizedSourceGallery.imageAssets,
                 variations: normalizedVariations,
                 variationFiles,
                 variationImageIndexes,
@@ -1294,12 +1311,12 @@ router.post('/', protect, authorize('vendor', 'admin'), parseProductImageUpload,
 
             let finalImageAssets = mediaState.imageAssets;
             if (productTypeValue !== 'variable' && finalImageAssets.length === 0) {
-                finalImageAssets = sourceGallery.imageAssets;
+                finalImageAssets = normalizedSourceGallery.imageAssets;
             }
             if (productTypeValue === 'variable' && finalImageAssets.length === 0) {
                 finalImageAssets = buildVariableProductGallery(mediaState.variations);
                 if (finalImageAssets.length === 0) {
-                    finalImageAssets = sourceGallery.imageAssets;
+                    finalImageAssets = normalizedSourceGallery.imageAssets;
                 }
             }
 
@@ -1418,6 +1435,10 @@ router.put('/:id', protect, authorize('vendor', 'admin'), parseProductImageUploa
     const previousProductSnapshot = product.toObject();
     const updates = { ...req.body };
     const sourceGallery = normalizeProductImages(product);
+    const normalizedSourceGallery = {
+        imageAssets: filterLegacyLocalProductAssets(sourceGallery.imageAssets),
+        images: filterLegacyLocalProductUrls(sourceGallery.images),
+    };
     const existingVariations = Array.isArray(product.variations)
         ? product.variations.map((variation) => cloneVariation(variation.toObject ? variation.toObject() : variation))
         : [];
@@ -1507,8 +1528,8 @@ router.put('/:id', protect, authorize('vendor', 'admin'), parseProductImageUploa
     const variationImageIndexes = parseJsonArray(req.body.variationImageIndexes);
     const imageOrder = parseJsonArray(updates.imageOrder);
     const submittedGalleryUrls = updates.imageUrls !== undefined
-        ? parseStringList(updates.imageUrls, /,/)
-        : sourceGallery.images;
+        ? filterLegacyLocalProductUrls(parseStringList(updates.imageUrls, /,/))
+        : normalizedSourceGallery.images;
     const shouldRebuildMedia = galleryFiles.length > 0
         || variationFiles.length > 0
         || updates.imageUrls !== undefined
@@ -1526,7 +1547,7 @@ router.put('/:id', protect, authorize('vendor', 'admin'), parseProductImageUploa
                 galleryFiles,
                 galleryUrls: submittedGalleryUrls,
                 imageOrder,
-                baseImageAssets: sourceGallery.imageAssets,
+                baseImageAssets: normalizedSourceGallery.imageAssets,
                 variations: normalizedVariationUpdates,
                 variationFiles,
                 variationImageIndexes,
@@ -1544,7 +1565,7 @@ router.put('/:id', protect, authorize('vendor', 'admin'), parseProductImageUploa
             if (effectiveProductType === 'variable' && finalImageAssets.length === 0) {
                 finalImageAssets = buildVariableProductGallery(mediaState.variations);
                 if (finalImageAssets.length === 0) {
-                    finalImageAssets = sourceGallery.imageAssets;
+                    finalImageAssets = normalizedSourceGallery.imageAssets;
                 }
             }
 

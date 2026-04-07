@@ -30,15 +30,44 @@ const isRealValue = (value) => {
     return true;
 };
 
-const hasCloudinaryConfig = isRealValue(process.env.CLOUDINARY_CLOUD_NAME)
-    && isRealValue(process.env.CLOUDINARY_API_KEY)
-    && isRealValue(process.env.CLOUDINARY_API_SECRET);
+const parseCloudinaryUrl = (value) => {
+    const normalized = String(value || '').trim();
+    if (!normalized) return null;
+
+    try {
+        const parsed = new URL(normalized);
+        const cloudName = parsed.hostname;
+        const apiKey = decodeURIComponent(parsed.username || '');
+        const apiSecret = decodeURIComponent(parsed.password || '');
+
+        if (!cloudName || !apiKey || !apiSecret) return null;
+
+        return { cloudName, apiKey, apiSecret };
+    } catch (error) {
+        return null;
+    }
+};
+
+const cloudinaryUrlConfig = parseCloudinaryUrl(process.env.CLOUDINARY_URL);
+const cloudinaryCloudName = isRealValue(process.env.CLOUDINARY_CLOUD_NAME)
+    ? process.env.CLOUDINARY_CLOUD_NAME
+    : cloudinaryUrlConfig?.cloudName;
+const cloudinaryApiKey = isRealValue(process.env.CLOUDINARY_API_KEY)
+    ? process.env.CLOUDINARY_API_KEY
+    : cloudinaryUrlConfig?.apiKey;
+const cloudinaryApiSecret = isRealValue(process.env.CLOUDINARY_API_SECRET)
+    ? process.env.CLOUDINARY_API_SECRET
+    : cloudinaryUrlConfig?.apiSecret;
+
+const hasCloudinaryConfig = isRealValue(cloudinaryCloudName)
+    && isRealValue(cloudinaryApiKey)
+    && isRealValue(cloudinaryApiSecret);
 
 if (hasCloudinaryConfig) {
     cloudinary.config({
-        cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-        api_key: process.env.CLOUDINARY_API_KEY,
-        api_secret: process.env.CLOUDINARY_API_SECRET,
+        cloud_name: cloudinaryCloudName,
+        api_key: cloudinaryApiKey,
+        api_secret: cloudinaryApiSecret,
     });
 }
 
@@ -230,9 +259,16 @@ const uploadBufferImage = async ({
     mimetype,
     resourceType = 'image',
     context,
+    requireCloudinary = false,
 }) => {
     if (!buffer) {
         throw new Error('Cannot upload an empty image buffer.');
+    }
+
+    if (requireCloudinary && !hasCloudinaryConfig) {
+        const configurationError = new Error('Cloudinary product image uploads are not configured on the server.');
+        configurationError.statusCode = 500;
+        throw configurationError;
     }
 
     const normalizedFolder = normalizeFolderPath(folder, 'products');
@@ -321,13 +357,13 @@ const createSignedUploadSignature = (paramsToSign = {}) => {
 
     const timestamp = paramsToSign.timestamp || Math.floor(Date.now() / 1000);
     const payload = { ...paramsToSign, timestamp };
-    const signature = cloudinary.utils.api_sign_request(payload, process.env.CLOUDINARY_API_SECRET);
+    const signature = cloudinary.utils.api_sign_request(payload, cloudinaryApiSecret);
 
     return {
         timestamp,
         signature,
-        apiKey: process.env.CLOUDINARY_API_KEY,
-        cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+        apiKey: cloudinaryApiKey,
+        cloudName: cloudinaryCloudName,
     };
 };
 
