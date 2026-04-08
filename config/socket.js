@@ -29,6 +29,10 @@ const initSocket = (io) => {
             socket.join(`order_${orderId}`);
         });
 
+        socket.on('unsubscribeOrder', (orderId) => {
+            socket.leave(`order_${orderId}`);
+        });
+
         socket.on('disconnect', () => {
             // Clean up
             for (const [userId, socketId] of connectedUsers.entries()) {
@@ -52,8 +56,8 @@ const initSocket = (io) => {
     };
 
     // Helper: emit order update
-    io.emitOrderUpdate = (orderId, data) => {
-        io.to(`order_${orderId}`).emit('orderUpdate', data);
+    io.emitOrderUpdate = (orderId, data = {}) => {
+        io.to(`order_${orderId}`).emit('orderUpdate', { orderId, ...data });
     };
 
     // Helper: emit to admin
