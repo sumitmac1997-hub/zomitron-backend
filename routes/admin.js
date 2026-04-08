@@ -537,6 +537,18 @@ router.put('/refunds/:refundId', asyncHandler(async (req, res) => {
     }
 
     await order.save();
+    const io = req.app.get('io');
+    if (io) {
+        const payload = {
+            orderId: order._id,
+            type: 'refund',
+            refundId: reqItem._id,
+            refundStatus: status,
+            itemId: reqItem.itemId,
+        };
+        io.emitToUser(order.customerId?.toString(), 'orderUpdate', payload);
+        io.emitOrderUpdate(order._id.toString(), payload);
+    }
     res.json({ success: true, refund: reqItem, orderId: order._id });
 }));
 
