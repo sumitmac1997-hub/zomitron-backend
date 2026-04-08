@@ -20,6 +20,60 @@ const normalizeOptionalString = (value) => {
 const normalizeEmail = (value) => normalizeOptionalString(value)?.toLowerCase();
 
 const normalizeMobileInput = (value) => normalizeIndianMobileNumber(normalizeOptionalString(value));
+const normalizeAddressPincode = (value) => {
+    const digits = String(value || '').replace(/\D/g, '');
+    return digits.length === 6 ? digits : undefined;
+};
+const normalizeCoordinate = (value) => {
+    if (value === undefined || value === null || value === '') return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+};
+const normalizeAddressesInput = (addresses) => {
+    if (addresses === undefined) return undefined;
+    if (!Array.isArray(addresses)) return null;
+
+    const normalizedAddresses = addresses
+        .map((address, index) => {
+            if (!address || typeof address !== 'object') return null;
+
+            const line1 = normalizeOptionalString(address.line1);
+            const city = normalizeOptionalString(address.city);
+            const state = normalizeOptionalString(address.state);
+            const pincode = normalizeAddressPincode(address.pincode);
+
+            // Ignore completely blank address rows.
+            if (!line1 && !city && !state && !pincode) {
+                return null;
+            }
+
+            return {
+                ...(address._id ? { _id: address._id } : {}),
+                label: normalizeOptionalString(address.label) || `Address ${index + 1}`,
+                line1: line1 || '',
+                line2: normalizeOptionalString(address.line2) || '',
+                city: city || '',
+                state: state || '',
+                pincode: pincode || '',
+                lat: normalizeCoordinate(address.lat),
+                lng: normalizeCoordinate(address.lng),
+                isDefault: Boolean(address.isDefault),
+            };
+        })
+        .filter(Boolean);
+
+    let defaultAssigned = false;
+    normalizedAddresses.forEach((address) => {
+        const shouldBeDefault = address.isDefault && !defaultAssigned;
+        address.isDefault = shouldBeDefault;
+        if (shouldBeDefault) defaultAssigned = true;
+    });
+    if (normalizedAddresses.length > 0 && !defaultAssigned) {
+        normalizedAddresses[0].isDefault = true;
+    }
+
+    return normalizedAddresses;
+};
 
 const findUserByMobileNumber = (mobileNumber) => User.findOne({
     $or: [{ mobileNumber }, { phone: mobileNumber }],
@@ -457,7 +511,7 @@ router.post('/google', asyncHandler(async (req, res) => {
 // PUT /api/auth/update-profile
 router.put('/update-profile', protect, asyncHandler(async (req, res) => {
     const name = normalizeOptionalString(req.body.name);
-    const addresses = req.body.addresses;
+    const addresses = normalizeAddressesInput(req.body.addresses);
     const fcmToken = normalizeOptionalString(req.body.fcmToken);
     const requestedMobileNumber = req.body.mobileNumber ?? req.body.phone;
     const hasMobileUpdate = requestedMobileNumber !== undefined;
@@ -465,6 +519,9 @@ router.put('/update-profile', protect, asyncHandler(async (req, res) => {
 
     if (hasMobileUpdate && !mobileNumber) {
         return res.status(400).json({ success: false, message: 'Invalid mobile number' });
+    }
+    if (req.body.addresses !== undefined && addresses === null) {
+        return res.status(400).json({ success: false, message: 'Addresses must be an array' });
     }
 
     if (mobileNumber) {
@@ -483,7 +540,7 @@ router.put('/update-profile', protect, asyncHandler(async (req, res) => {
         updates.mobileNumber = mobileNumber;
         updates.phone = mobileNumber;
     }
-    if (addresses) updates.addresses = addresses;
+    if (addresses !== undefined) updates.addresses = addresses;
     if (fcmToken) updates.fcmToken = fcmToken;
 
     const user = await User.findByIdAndUpdate(req.user._id, updates, {
