@@ -438,8 +438,10 @@ const buildPublicProductsFilter = async (query) => {
     const filter = {
         isActive: true,
         isApproved: true,
-        stock: { $gt: 0 },
     };
+
+    // Keep zero-stock products in the public catalog so the shop page can
+    // render them with an explicit "Out of Stock" state instead of hiding them.
 
     if (category && !isAllCategorySlug(category)) {
         const categoryIds = await loadCategoryFilterIds(category);

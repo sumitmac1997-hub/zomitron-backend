@@ -240,6 +240,69 @@ describe('Product library and clone routes', () => {
         }));
     });
 
+    test('GET /api/products keeps out-of-stock items in the public shop listing', async () => {
+        Product.find.mockReturnValueOnce(makeLeanChain([
+            {
+                _id: 'product-out-of-stock',
+                title: 'Sold Out Phone',
+                slug: 'sold-out-phone',
+                images: ['/phone.jpg'],
+                price: 19999,
+                discountPrice: 17999,
+                stock: 0,
+                city: 'Varanasi',
+                state: 'Uttar Pradesh',
+                pincode: '221001',
+                ratings: { average: 4.4, count: 12 },
+                isFeatured: false,
+                vendorId: 'vendor-1',
+                category: 'cat-1',
+                categories: ['cat-1'],
+                subCategory: null,
+                categoryName: 'Electronics',
+                tags: ['phone'],
+                attributes: [],
+                location: { type: 'Point', coordinates: [82.9739, 25.3176] },
+                createdAt: '2026-01-01T00:00:00.000Z',
+                orderCount: 4,
+            },
+        ]));
+        Product.countDocuments.mockResolvedValueOnce(1);
+        Vendor.find.mockReturnValueOnce(makeLeanChain([
+            {
+                _id: 'vendor-1',
+                storeName: 'Open Store',
+                storeLogo: '/logo.jpg',
+                ratings: { average: 4.5, count: 30 },
+                address: { line1: 'Market Road' },
+                location: { type: 'Point', coordinates: [82.9739, 25.3176] },
+                isOpen: true,
+                approved: true,
+            },
+        ]));
+        Category.find.mockReturnValueOnce(makeLeanChain([
+            { _id: 'cat-1', name: 'Electronics', slug: 'electronics', icon: '📱' },
+        ]));
+
+        const res = await invokeRoute({
+            path: '/',
+            method: 'get',
+            query: { page: '1', limit: '20' },
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(Product.countDocuments).toHaveBeenCalledWith(expect.not.objectContaining({
+            stock: expect.anything(),
+        }));
+        expect(res.body.products).toEqual(expect.arrayContaining([
+            expect.objectContaining({
+                _id: 'product-out-of-stock',
+                stock: 0,
+                title: 'Sold Out Phone',
+            }),
+        ]));
+    });
+
     test('POST /api/products creates vendor-specific copies from a source product and skips duplicates', async () => {
         Vendor.find.mockResolvedValueOnce([
             {
