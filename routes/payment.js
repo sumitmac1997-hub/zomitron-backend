@@ -5,11 +5,15 @@ const Stripe = require('stripe');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const Order = require('../models/Order');
-const Vendor = require('../models/Vendor');
 const { protect, optionalAuth } = require('../middleware/auth');
+const {
+    finalizeOrderPlacement,
+    abortOrderDraft,
+} = require('../utils/orderPlacement');
 
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
-const razorpay = (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET)
+const isRazorpayConfigured = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+const razorpay = isRazorpayConfigured
     ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
     : null;
 
@@ -74,6 +78,15 @@ router.post('/razorpay/order', optionalAuth, asyncHandler(async (req, res) => {
     const { orderId } = req.body;
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (order.paymentMethod !== 'razorpay') {
+        return res.status(400).json({ success: false, message: 'Order is not using Razorpay' });
+    }
+    if (order.isPlaced !== false) {
+        return res.status(400).json({ success: false, message: 'Order has already been finalized' });
+    }
+    if (!order.stockReserved || order.paymentStatus === 'failed' || order.orderStatus === 'cancelled') {
+        return res.status(409).json({ success: false, message: 'This Razorpay checkout session has expired. Please try again.' });
+    }
 
     const rzpOrder = await razorpay.orders.create({
         amount: Math.round(order.total * 100), // paise
@@ -99,6 +112,10 @@ router.post('/razorpay/order', optionalAuth, asyncHandler(async (req, res) => {
 router.post('/razorpay/verify', optionalAuth, asyncHandler(async (req, res) => {
     const { razorpayOrderId, razorpayPaymentId, razorpaySignature, orderId } = req.body;
 
+    if (!isRazorpayConfigured) {
+        return res.status(503).json({ success: false, message: 'Razorpay not configured' });
+    }
+
     const expectedSig = crypto
         .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
         .update(`${razorpayOrderId}|${razorpayPaymentId}`)
@@ -110,17 +127,67 @@ router.post('/razorpay/verify', optionalAuth, asyncHandler(async (req, res) => {
 
     const order = await Order.findById(orderId);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (order.paymentMethod !== 'razorpay') {
+        return res.status(400).json({ success: false, message: 'Order is not using Razorpay' });
+    }
+    if (!order.stockReserved || order.paymentStatus === 'failed' || order.orderStatus === 'cancelled') {
+        return res.status(409).json({ success: false, message: 'This Razorpay checkout session has expired. Please try again.' });
+    }
+    if (order.razorpayOrderId && order.razorpayOrderId !== razorpayOrderId) {
+        return res.status(400).json({ success: false, message: 'Razorpay order mismatch' });
+    }
+    if (order.isPlaced !== false && order.paymentStatus === 'paid') {
+        return res.json({
+            success: true,
+            message: 'Payment already verified',
+            order: { _id: order._id, orderNumber: order.orderNumber, orderStatus: order.orderStatus },
+        });
+    }
 
-    order.paymentStatus = 'paid';
-    order.orderStatus = 'confirmed';
-    order.confirmedAt = new Date();
-    order.razorpayPaymentId = razorpayPaymentId;
-    await order.save();
+    const finalized = await finalizeOrderPlacement({
+        orderId: order._id,
+        app: req.app,
+        markPaid: true,
+        razorpayPaymentId,
+    });
 
-    const io = req.app.get('io');
-    if (io) io.emitToUser(order.customerId?.toString(), 'paymentSuccess', { orderId: order._id });
+    res.json({
+        success: true,
+        message: 'Payment verified',
+        order: {
+            _id: finalized.order._id,
+            orderNumber: finalized.order.orderNumber,
+            orderStatus: finalized.order.orderStatus,
+        },
+        user: finalized.updatedUser,
+    });
+}));
 
-    res.json({ success: true, message: 'Payment verified', order: { _id: order._id, orderNumber: order.orderNumber, orderStatus: order.orderStatus } });
+// POST /api/payments/razorpay/abort — Abort pending Razorpay checkout
+router.post('/razorpay/abort', optionalAuth, asyncHandler(async (req, res) => {
+    const { orderId, reason } = req.body;
+    if (!orderId) {
+        return res.status(400).json({ success: false, message: 'orderId is required' });
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) {
+        return res.json({ success: true, message: 'Draft order already removed' });
+    }
+    if (order.paymentMethod !== 'razorpay') {
+        return res.status(400).json({ success: false, message: 'Order is not using Razorpay' });
+    }
+
+    const abortedOrder = await abortOrderDraft({
+        orderId,
+        reason: reason || 'Razorpay checkout aborted before payment completion',
+    });
+
+    if (abortedOrder?.isPlaced !== false) {
+        return res.status(409).json({ success: false, message: 'Order has already been placed' });
+    }
+
+    res.json({ success: true, message: 'Pending Razorpay checkout cancelled' });
 }));
 
 // POST /api/payments/cod/confirm — COD order confirmation
@@ -139,11 +206,11 @@ router.get('/config', (req, res) => {
     res.json({
         success: true,
         stripe: { publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null },
-        razorpay: { keyId: process.env.RAZORPAY_KEY_ID || null },
+        razorpay: { keyId: isRazorpayConfigured ? process.env.RAZORPAY_KEY_ID : null },
         paypal: { clientId: process.env.PAYPAL_CLIENT_ID || null },
         available: {
             stripe: !!process.env.STRIPE_SECRET_KEY,
-            razorpay: !!process.env.RAZORPAY_KEY_ID,
+            razorpay: isRazorpayConfigured,
             cod: true,
         },
     });

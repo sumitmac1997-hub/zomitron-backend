@@ -251,7 +251,7 @@ router.get('/me/orders', protect, authorize('vendor'), asyncHandler(async (req, 
     if (!vendor) return res.status(404).json({ success: false, message: 'Vendor not found' });
 
     const { page = 1, limit = 20, status } = req.query;
-    const query = { vendorIds: vendor._id };
+    const query = { vendorIds: vendor._id, isPlaced: { $ne: false } };
     if (status) query.orderStatus = status;
 
     const total = await Order.countDocuments(query);
@@ -287,7 +287,7 @@ router.put('/orders/:orderId/fulfill', protect, authorize('vendor'), asyncHandle
         return res.status(400).json({ success: false, message: 'Invalid fulfillment status' });
     }
 
-    const order = await Order.findById(req.params.orderId);
+    const order = await Order.findOne({ _id: req.params.orderId, isPlaced: { $ne: false } });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
     if (!order.vendorIds.some(id => id.toString() === vendor._id.toString())) {
         return res.status(403).json({ success: false, message: 'Not your order' });
@@ -353,6 +353,7 @@ router.get('/me/earnings', protect, authorize('vendor'), asyncHandler(async (req
     const stats = await Order.aggregate([
         {
             $match: {
+                isPlaced: { $ne: false },
                 vendorIds: vendor._id,
                 orderStatus: 'delivered',
                 createdAt: { $gte: from },

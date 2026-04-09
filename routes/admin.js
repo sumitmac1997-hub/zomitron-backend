@@ -39,19 +39,19 @@ router.get('/dashboard', asyncHandler(async (req, res) => {
         User.countDocuments({ role: 'customer' }),
         Vendor.countDocuments({ approved: true }),
         Product.countDocuments({ isActive: true }),
-        Order.countDocuments(matchByPeriod),
+        Order.countDocuments({ ...matchByPeriod, isPlaced: { $ne: false } }),
         Order.aggregate([
-            { $match: { ...matchByPeriod, paymentStatus: 'paid' } },
+            { $match: { ...matchByPeriod, isPlaced: { $ne: false }, paymentStatus: 'paid' } },
             { $group: { _id: null, total: { $sum: '$total' }, platformFee: { $sum: '$platformFee' } } },
         ]),
         Vendor.countDocuments({ approved: false }),
-        Order.find(matchByPeriod)
+        Order.find({ ...matchByPeriod, isPlaced: { $ne: false } })
             .populate('customerId', 'name')
             .sort({ createdAt: -1 })
             .limit(10)
             .lean(),
         Order.aggregate([
-            { $match: matchByPeriod },
+            { $match: { ...matchByPeriod, isPlaced: { $ne: false } } },
             { $unwind: '$items' },
             { $lookup: { from: 'products', localField: 'items.productId', foreignField: '_id', as: 'product' } },
             { $unwind: '$product' },
@@ -253,7 +253,9 @@ router.get('/orders', asyncHandler(async (req, res) => {
 
     const limitNum = Math.min(parseInt(limit), 100);
     const pageNum = parseInt(page);
-    const query = andConditions.length ? { $and: andConditions } : {};
+    const query = andConditions.length
+        ? { $and: [{ isPlaced: { $ne: false } }, ...andConditions] }
+        : { isPlaced: { $ne: false } };
     const total = await Order.countDocuments(query);
     const orders = await Order.find(query)
         .populate('customerId', 'name email')
@@ -268,7 +270,7 @@ router.get('/orders', asyncHandler(async (req, res) => {
 
 // GET /api/admin/orders/:id/invoice — PDF invoice
 router.get('/orders/:id/invoice', asyncHandler(async (req, res) => {
-    const order = await Order.findById(req.params.id)
+    const order = await Order.findOne({ _id: req.params.id, isPlaced: { $ne: false } })
         .populate('customerId', 'name email phone')
         .populate('vendorIds', 'storeName')
         .lean();
@@ -477,7 +479,7 @@ router.put('/refund-settings', asyncHandler(async (req, res) => {
 router.get('/refunds', asyncHandler(async (req, res) => {
     const { status } = req.query; // optional filter
 
-    const orders = await Order.find({ 'refundRequests.0': { $exists: true } })
+    const orders = await Order.find({ isPlaced: { $ne: false }, 'refundRequests.0': { $exists: true } })
         .populate('customerId', 'name email phone')
         .populate('vendorIds', 'storeName address city state pincode phone')
         .populate('refundRequests.vendorId', 'storeName address city state pincode phone')
@@ -522,7 +524,7 @@ router.put('/refunds/:refundId', asyncHandler(async (req, res) => {
         return res.status(400).json({ success: false, message: 'Invalid refund status' });
     }
 
-    const order = await Order.findOne({ 'refundRequests._id': req.params.refundId });
+    const order = await Order.findOne({ isPlaced: { $ne: false }, 'refundRequests._id': req.params.refundId });
     if (!order) return res.status(404).json({ success: false, message: 'Refund request not found' });
 
     const reqItem = order.refundRequests.id(req.params.refundId);
@@ -579,7 +581,7 @@ router.put('/users/:id/status', asyncHandler(async (req, res) => {
 // GET /api/admin/analytics/sales-by-region
 router.get('/analytics/sales-by-region', asyncHandler(async (req, res) => {
     const stats = await Order.aggregate([
-        { $match: { paymentStatus: 'paid' } },
+        { $match: { isPlaced: { $ne: false }, paymentStatus: 'paid' } },
         { $group: { _id: '$deliveryAddress.city', total: { $sum: '$total' }, count: { $sum: 1 } } },
         { $sort: { total: -1 } }, { $limit: 20 },
     ]);

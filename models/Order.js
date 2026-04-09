@@ -44,6 +44,9 @@ const orderSchema = new mongoose.Schema(
         razorpayOrderId: String,
         razorpayPaymentId: String,
         paypalOrderId: String,
+        isPlaced: { type: Boolean, default: false },
+        stockReserved: { type: Boolean, default: false },
+        placedAt: Date,
         // Delivery
         deliveryAddress: {
             name: String,
@@ -145,6 +148,7 @@ const orderSchema = new mongoose.Schema(
 // Indexes
 orderSchema.index({ customerId: 1, createdAt: -1 });
 orderSchema.index({ vendorIds: 1, createdAt: -1 });
+orderSchema.index({ isPlaced: 1, createdAt: -1 });
 orderSchema.index({ orderStatus: 1, createdAt: -1 });
 orderSchema.index({ paymentStatus: 1, createdAt: -1 });
 orderSchema.index({ refundStatus: 1, createdAt: -1 });
