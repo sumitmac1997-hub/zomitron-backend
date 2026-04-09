@@ -11,11 +11,47 @@ const {
     abortOrderDraft,
 } = require('../utils/orderPlacement');
 
+const normalizeRazorpayCredential = (value) => (value ?? '').toString().trim();
+const createHttpError = (statusCode, message) => {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+};
+const razorpayKeyId = normalizeRazorpayCredential(process.env.RAZORPAY_KEY_ID);
+const razorpayKeySecret = normalizeRazorpayCredential(process.env.RAZORPAY_KEY_SECRET);
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
-const isRazorpayConfigured = Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET);
+const isRazorpayConfigured = Boolean(razorpayKeyId && razorpayKeySecret);
 const razorpay = isRazorpayConfigured
-    ? new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET })
+    ? new Razorpay({ key_id: razorpayKeyId, key_secret: razorpayKeySecret })
     : null;
+
+const extractRazorpayErrorMessage = (error) => {
+    const candidates = [
+        error?.error?.description,
+        error?.response?.body?.error?.description,
+        error?.response?.data?.error?.description,
+        error?.response?.body?.description,
+        error?.description,
+        error?.message,
+    ]
+        .map((value) => (typeof value === 'string' ? value.trim() : ''))
+        .filter(Boolean);
+
+    const message = candidates.find((value) => !/^internal server error$/i.test(value));
+    return message || 'Unable to start Razorpay checkout right now. Please verify the Razorpay key ID, key secret, and account mode configured on the backend.';
+};
+
+const getRazorpayStatusCode = (error, fallback = 502) => {
+    const statusCode = [
+        error?.statusCode,
+        error?.response?.statusCode,
+        error?.response?.status,
+    ]
+        .map((value) => Number(value))
+        .find((value) => Number.isInteger(value) && value >= 400 && value < 600);
+
+    return statusCode || fallback;
+};
 
 // POST /api/payments/stripe/intent — Create Stripe Payment Intent
 router.post('/stripe/intent', optionalAuth, asyncHandler(async (req, res) => {
@@ -88,12 +124,20 @@ router.post('/razorpay/order', optionalAuth, asyncHandler(async (req, res) => {
         return res.status(409).json({ success: false, message: 'This Razorpay checkout session has expired. Please try again.' });
     }
 
-    const rzpOrder = await razorpay.orders.create({
-        amount: Math.round(order.total * 100), // paise
-        currency: 'INR',
-        receipt: order.orderNumber,
-        notes: { orderId: order._id.toString() },
-    });
+    let rzpOrder;
+    try {
+        rzpOrder = await razorpay.orders.create({
+            amount: Math.round(order.total * 100), // paise
+            currency: 'INR',
+            receipt: String(order.orderNumber || order._id).slice(0, 40),
+            notes: {
+                orderId: order._id.toString(),
+                orderNumber: order.orderNumber,
+            },
+        });
+    } catch (error) {
+        throw createHttpError(getRazorpayStatusCode(error), extractRazorpayErrorMessage(error));
+    }
 
     order.razorpayOrderId = rzpOrder.id;
     await order.save();
@@ -103,7 +147,7 @@ router.post('/razorpay/order', optionalAuth, asyncHandler(async (req, res) => {
         razorpayOrderId: rzpOrder.id,
         amount: order.total,
         currency: 'INR',
-        keyId: process.env.RAZORPAY_KEY_ID,
+        keyId: razorpayKeyId,
         orderNumber: order.orderNumber,
     });
 }));
@@ -117,7 +161,7 @@ router.post('/razorpay/verify', optionalAuth, asyncHandler(async (req, res) => {
     }
 
     const expectedSig = crypto
-        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+        .createHmac('sha256', razorpayKeySecret)
         .update(`${razorpayOrderId}|${razorpayPaymentId}`)
         .digest('hex');
 
@@ -206,7 +250,7 @@ router.get('/config', (req, res) => {
     res.json({
         success: true,
         stripe: { publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || null },
-        razorpay: { keyId: isRazorpayConfigured ? process.env.RAZORPAY_KEY_ID : null },
+        razorpay: { keyId: isRazorpayConfigured ? razorpayKeyId : null },
         paypal: { clientId: process.env.PAYPAL_CLIENT_ID || null },
         available: {
             stripe: !!process.env.STRIPE_SECRET_KEY,
