@@ -4,6 +4,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const User = require('../models/User');
 const Vendor = require('../models/Vendor');
+const Rider = require('../models/Rider');
 const { protect, generateTokens } = require('../middleware/auth');
 const { sendEmail } = require('../utils/email');
 const { isFirebaseAdminConfigured, verifyFirebaseIdToken } = require('../config/firebaseAdmin');
@@ -92,9 +93,22 @@ const buildSessionPayload = async (user) => {
         vendorInfo = await Vendor.findOne({ userId: user._id }).select('_id storeName approved');
     }
 
+    // Check if this customer is also a registered rider
+    let isRider = false;
+    let riderStatus = null;
+    if (user.role === 'customer') {
+        const riderProfile = await Rider.findOne({ userId: user._id }).select('status');
+        if (riderProfile) {
+            isRider = true;
+            riderStatus = riderProfile.status; // 'PENDING' | 'ACTIVE' | 'REJECTED'
+        }
+    }
+
     return {
         ...user.toJSON(),
         vendor: vendorInfo,
+        isRider,
+        riderStatus,
     };
 };
 
