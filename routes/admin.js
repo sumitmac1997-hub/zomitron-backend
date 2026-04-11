@@ -9,6 +9,7 @@ const Category = require('../models/Category');
 const ShippingRule = require('../models/ShippingRule');
 const Setting = require('../models/Setting');
 const AdminNotification = require('../models/AdminNotification');
+const Rider = require('../models/Rider');
 const { getSettingValue, setSettingValue } = require('../utils/settings');
 const { protect, authorize } = require('../middleware/auth');
 const { geocodePincode } = require('../utils/geocode');
@@ -615,6 +616,89 @@ router.put('/notifications/:id/read', asyncHandler(async (req, res) => {
         { new: true }
     );
     res.json({ success: true, notification });
+}));
+
+// ──────────────────────────────────────────────────────
+// RIDER MANAGEMENT
+// ──────────────────────────────────────────────────────
+
+// GET /api/admin/riders — list all riders (paginated + filter)
+router.get('/riders', asyncHandler(async (req, res) => {
+    const { page = 1, limit = 20, status, search } = req.query;
+    const query = {};
+    if (status) query.status = status;
+
+    const pageNum = parseInt(page);
+    const limitNum = Math.min(parseInt(limit), 100);
+
+    // If search, find matching users first
+    if (search) {
+        const matchingUsers = await User.find({
+            $or: [
+                { name: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } },
+            ],
+        }).select('_id').lean();
+        query.userId = { $in: matchingUsers.map((u) => u._id) };
+    }
+
+    const [riders, total] = await Promise.all([
+        Rider.find(query)
+            .populate('userId', 'name email mobileNumber phone avatar createdAt')
+            .sort({ createdAt: -1 })
+            .skip((pageNum - 1) * limitNum)
+            .limit(limitNum)
+            .lean(),
+        Rider.countDocuments(query),
+    ]);
+
+    res.json({ success: true, riders, total, page: pageNum, pages: Math.ceil(total / limitNum) });
+}));
+
+// GET /api/admin/riders/:id — get a single rider
+router.get('/riders/:id', asyncHandler(async (req, res) => {
+    const rider = await Rider.findById(req.params.id)
+        .populate('userId', 'name email mobileNumber phone avatar createdAt')
+        .lean();
+    if (!rider) return res.status(404).json({ success: false, message: 'Rider not found' });
+    res.json({ success: true, rider });
+}));
+
+// PUT /api/admin/riders/:id/approve — approve or reject
+router.put('/riders/:id/approve', asyncHandler(async (req, res) => {
+    const { approved, rejectionReason } = req.body;
+    const rider = await Rider.findById(req.params.id).populate('userId', 'name email mobileNumber');
+    if (!rider) return res.status(404).json({ success: false, message: 'Rider not found' });
+
+    rider.status = approved ? 'ACTIVE' : 'REJECTED';
+    rider.rejectionReason = approved ? undefined : (rejectionReason || 'Application not approved');
+    rider.approvedAt = approved ? new Date() : undefined;
+    rider.approvedBy = req.user._id;
+    await rider.save();
+
+    // Notify rider via socket
+    const io = req.app.get('io');
+    if (io) {
+        io.emitToUser(rider.userId._id.toString(), 'riderApproval', {
+            status: rider.status,
+            message: approved ? 'Congratulations! Your rider profile is approved. You can now go online and accept deliveries.' : (rejectionReason || 'Your rider application was not approved.'),
+        });
+        io.emitToAdmin('riderApproved', { riderId: rider._id, status: rider.status });
+    }
+
+    res.json({ success: true, rider, message: approved ? 'Rider approved' : 'Rider rejected' });
+}));
+
+// PUT /api/admin/riders/:id/status — activate / deactivate
+router.put('/riders/:id/status', asyncHandler(async (req, res) => {
+    const { isActive } = req.body;
+    const rider = await Rider.findByIdAndUpdate(
+        req.params.id,
+        { isActive: Boolean(isActive), isOnline: isActive ? undefined : false },
+        { new: true }
+    ).populate('userId', 'name email');
+    if (!rider) return res.status(404).json({ success: false, message: 'Rider not found' });
+    res.json({ success: true, rider, message: isActive ? 'Rider activated' : 'Rider deactivated' });
 }));
 
 module.exports = router;

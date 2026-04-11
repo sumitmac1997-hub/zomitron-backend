@@ -134,6 +134,17 @@ const orderSchema = new mongoose.Schema(
                 fulfilledAt: Date,
             },
         ],
+        // Rider / Delivery Agent
+        assignedRiderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Rider', default: null },
+        deliveryStatus: {
+            type: String,
+            enum: ['unassigned', 'assigned', 'picked', 'out_for_delivery', 'delivered'],
+            default: 'unassigned',
+        },
+        riderAssignedAt: Date,
+        pickedAt: Date,
+        outForDeliveryAt: Date,
+        deliveredByRiderAt: Date,
         // Notes
         customerNote: String,
         adminNote: String,

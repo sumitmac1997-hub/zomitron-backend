@@ -7,6 +7,7 @@ const Vendor = require('../models/Vendor');
 const { protect, optionalAuth, authorize } = require('../middleware/auth');
 const { getDeliveryInfo } = require('../utils/deliveryETA');
 const { getSettingValue } = require('../utils/settings');
+const { autoAssignRider } = require('../config/socket');
 const {
     prepareOrderDraft,
     createOrderDraft,
@@ -178,6 +179,30 @@ router.put('/:id/status', protect, authorize('admin'), asyncHandler(async (req, 
     if (io) {
         io.emitToUser(order.customerId?.toString(), 'orderUpdate', { orderId: order._id, status });
         io.emitOrderUpdate(order._id.toString(), { status, trackingCode });
+    }
+
+    // 🚴 Auto-assign nearest rider when order is confirmed
+    if (status === 'confirmed' && io) {
+        setImmediate(async () => {
+            try {
+                // Get vendor location for the first vendor in the order
+                let vendorLocation = null;
+                if (order.vendorIds && order.vendorIds.length > 0) {
+                    const vendor = await Vendor.findById(order.vendorIds[0])
+                        .select('location city')
+                        .lean();
+                    if (vendor?.location?.coordinates?.length === 2) {
+                        vendorLocation = {
+                            lng: vendor.location.coordinates[0],
+                            lat: vendor.location.coordinates[1],
+                        };
+                    }
+                }
+                await autoAssignRider(io, order, vendorLocation);
+            } catch (err) {
+                console.error('[AutoAssign] Failed after order confirm:', err.message);
+            }
+        });
     }
 
     res.json({ success: true, order });

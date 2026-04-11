@@ -195,6 +195,7 @@ app.use('/api/payments', paymentLimiter, require('./routes/payment'));
 app.use('/api/taxes', require('./routes/tax'));
 app.use('/api/shipping', require('./routes/shipping'));
 app.use('/api/admin', require('./routes/admin'));
+app.use('/api/riders', require('./routes/rider'));
 app.use('/api/pincode', require('./routes/pincode'));
 app.use('/api/notifications', require('./routes/notification'));
 app.use('/api/coupons', require('./routes/coupon'));
