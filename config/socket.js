@@ -1,5 +1,6 @@
 const Rider = require('../models/Rider');
 const Order = require('../models/Order');
+const Vendor = require('../models/Vendor');
 
 // Haversine distance in km between two [lat, lng] points
 const haversineKm = (lat1, lng1, lat2, lng2) => {
@@ -56,6 +57,29 @@ const autoAssignRider = async (io, order, vendorLocation) => {
             return;
         }
 
+        // Fetch vendor details for the pickup card shown to rider
+        let vendorInfo = null;
+        if (order.vendorIds && order.vendorIds.length > 0) {
+            const v = await Vendor.findById(order.vendorIds[0])
+                .select('storeName address city phone mobileNumber location')
+                .lean();
+            if (v) {
+                const coords = v.location?.coordinates;
+                vendorInfo = {
+                    storeName: v.storeName || 'Vendor Store',
+                    address: v.address || v.city || '',
+                    city: v.city || '',
+                    phone: v.phone || v.mobileNumber || '',
+                    lat: vendorLocation?.lat || (coords ? coords[1] : null),
+                    lng: vendorLocation?.lng || (coords ? coords[0] : null),
+                };
+            }
+        }
+        // Fallback: use provided vendorLocation if vendor lookup failed
+        if (!vendorInfo && vendorLocation) {
+            vendorInfo = { storeName: 'Vendor', lat: vendorLocation.lat, lng: vendorLocation.lng };
+        }
+
         // Try riders one by one with 60-second timeout
         const tryNextRider = async (index) => {
             if (index >= sorted.length) {
@@ -71,7 +95,7 @@ const autoAssignRider = async (io, order, vendorLocation) => {
             io.emitToRider(rider._id.toString(), 'newDeliveryRequest', {
                 orderId: order._id,
                 orderNumber: order.orderNumber,
-                vendorAddress: order.items?.[0]?.vendorId,
+                vendorAddress: vendorInfo,   // ← full vendor pickup details
                 deliveryAddress: order.deliveryAddress,
                 items: order.items,
                 total: order.total,

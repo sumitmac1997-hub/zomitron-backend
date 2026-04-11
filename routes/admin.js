@@ -655,13 +655,21 @@ router.get('/riders', asyncHandler(async (req, res) => {
     res.json({ success: true, riders, total, page: pageNum, pages: Math.ceil(total / limitNum) });
 }));
 
-// GET /api/admin/riders/:id — get a single rider
+// GET /api/admin/riders/:id — get a single rider with full order history
 router.get('/riders/:id', asyncHandler(async (req, res) => {
     const rider = await Rider.findById(req.params.id)
         .populate('userId', 'name email mobileNumber phone avatar createdAt')
         .lean();
     if (!rider) return res.status(404).json({ success: false, message: 'Rider not found' });
-    res.json({ success: true, rider });
+
+    // Fetch this rider's full delivery history (last 100)
+    const orders = await Order.find({ assignedRiderId: rider._id })
+        .sort({ createdAt: -1 })
+        .limit(100)
+        .select('orderNumber deliveryStatus orderStatus deliveryAddress total createdAt riderAssignedAt pickedAt outForDeliveryAt deliveredByRiderAt')
+        .lean();
+
+    res.json({ success: true, rider, orders });
 }));
 
 // PUT /api/admin/riders/:id/approve — approve or reject
