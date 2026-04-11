@@ -57,28 +57,40 @@ const autoAssignRider = async (io, order, vendorLocation) => {
             return;
         }
 
-        // Fetch vendor details for the pickup card shown to rider
+        // ── Fetch vendor info in an ISOLATED try/catch ──────────────────────────
+        // A failure here must NEVER prevent rider notifications from being sent
         let vendorInfo = null;
-        if (order.vendorIds && order.vendorIds.length > 0) {
-            const v = await Vendor.findById(order.vendorIds[0])
-                .select('storeName address city phone mobileNumber location')
-                .lean();
-            if (v) {
-                const coords = v.location?.coordinates;
-                vendorInfo = {
-                    storeName: v.storeName || 'Vendor Store',
-                    address: v.address || v.city || '',
-                    city: v.city || '',
-                    phone: v.phone || v.mobileNumber || '',
-                    lat: vendorLocation?.lat || (coords ? coords[1] : null),
-                    lng: vendorLocation?.lng || (coords ? coords[0] : null),
-                };
+        try {
+            if (order.vendorIds && order.vendorIds.length > 0) {
+                const v = await Vendor.findById(order.vendorIds[0])
+                    .select('storeName address city state phone location')
+                    .lean();
+                if (v) {
+                    const coords = v.location?.coordinates;
+                    // address is an embedded object: { line1, line2, city, state, pincode }
+                    // Build a safe string for display
+                    const addrObj = v.address || {};
+                    const addrStr = [addrObj.line1, addrObj.city, addrObj.state]
+                        .filter(Boolean).join(', ');
+                    vendorInfo = {
+                        storeName: v.storeName || 'Vendor Store',
+                        address: addrStr || v.city || '',
+                        city: addrObj.city || v.city || '',
+                        phone: v.phone || '',
+                        lat: vendorLocation?.lat ?? (coords ? coords[1] : null),
+                        lng: vendorLocation?.lng ?? (coords ? coords[0] : null),
+                    };
+                }
             }
+        } catch (vendorErr) {
+            console.warn('[AutoAssign] Vendor lookup failed (non-fatal):', vendorErr.message);
         }
-        // Fallback: use provided vendorLocation if vendor lookup failed
+
+        // Fallback: use the vendorLocation already passed in
         if (!vendorInfo && vendorLocation) {
-            vendorInfo = { storeName: 'Vendor', lat: vendorLocation.lat, lng: vendorLocation.lng };
+            vendorInfo = { storeName: 'Vendor Store', lat: vendorLocation.lat, lng: vendorLocation.lng, address: '', phone: '' };
         }
+        // ── End vendor lookup ────────────────────────────────────────────────────
 
         // Try riders one by one with 60-second timeout
         const tryNextRider = async (index) => {
@@ -95,7 +107,7 @@ const autoAssignRider = async (io, order, vendorLocation) => {
             io.emitToRider(rider._id.toString(), 'newDeliveryRequest', {
                 orderId: order._id,
                 orderNumber: order.orderNumber,
-                vendorAddress: vendorInfo,   // ← full vendor pickup details
+                vendorAddress: vendorInfo,        // full pickup details (safe string address)
                 deliveryAddress: order.deliveryAddress,
                 items: order.items,
                 total: order.total,
@@ -103,27 +115,21 @@ const autoAssignRider = async (io, order, vendorLocation) => {
                 timeoutSeconds: 60,
             });
 
-            // 60-second timeout
+            // 60-second timeout — if rider doesn't respond, try next
             const timer = setTimeout(async () => {
-                // Check if the order was already accepted
                 const freshOrder = await Order.findById(order._id).lean();
-                if (freshOrder && freshOrder.assignedRiderId) {
-                    return; // Already accepted by this or another rider
-                }
-                // Notify rider that request expired
+                if (freshOrder && freshOrder.assignedRiderId) return; // already accepted
                 io.emitToRider(rider._id.toString(), 'deliveryRequestExpired', { orderId: order._id });
-                // Try next
                 tryNextRider(index + 1);
             }, 60000);
 
-            // Store timer reference so it can be cleared on accept
             if (!io._riderTimers) io._riderTimers = new Map();
             io._riderTimers.set(`${order._id}_${rider._id}`, timer);
         };
 
         tryNextRider(0);
     } catch (err) {
-        console.error('[AutoAssign] Error:', err.message);
+        console.error('[AutoAssign] Fatal error:', err.message);
     }
 };
 
